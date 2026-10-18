@@ -8,12 +8,13 @@ proof.  This tool never starts the host, writes target config/state, deletes
 target files, or prints config/secret contents.  Python 3.11+.
 """
 
-import argparse, hashlib, json, os, re, stat, sys, tempfile, tomllib
+import argparse, hashlib, json, os, re, shutil, stat, sys, tempfile, tomllib
 from datetime import datetime
 from pathlib import Path
 
 CARDS = "dc06efb1180646e15953b73ccb9dc0683b83676bd0062d1b8ff5831771ec4661"
 DEV, FORMAL = "kards_companion_dev", "kards_companion"
+BACKUP_SPACE_MARGIN = 16 * 1024 * 1024
 ALLOW = {"__init__.py", "plugin.toml", "README.md", "requirements.txt", "adapters",
          "delivery", "policy", "runtime", "state", "knowledge", "perception", "ui",
          "tests", "docs", "scripts"}
@@ -46,6 +47,107 @@ def bad_chain(anchor, target):
         if part is not None: cur = cur / part
         if cur.exists() and reparse(cur): return str(cur)
     return None
+
+
+def resolve_bundle_manifest(root, selection):
+    path = root / "bundle-manifest.json" if selection is True else Path(selection)
+    return path if path.is_absolute() else root / path
+
+
+def bundle_input(root, selection):
+    """Explicit opt-in: verify a payload manifest and return its file bytes."""
+    path, files, errors = resolve_bundle_manifest(root, selection), {}, []
+    try:
+        import bundle_manifest
+    except ImportError as exc:
+        reason = f"bundle_module_import:{type(exc).__name__}"
+        return path, {"enabled": True, "ok": False, "errors": [reason],
+                      "warnings": [], "manifest": str(path)}, files, [reason]
+    try:
+        report = bundle_manifest.verify_manifest(root, path)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        reason = f"bundle_verify:{type(exc).__name__}"
+        return path, {"enabled": True, "ok": False, "errors": [reason],
+                      "warnings": [], "manifest": str(path)}, files, [reason]
+    errors = [f"bundle:{reason}" for reason in report.get("errors", [])]
+    optional_det = report.get("optional", {}).get("kards_det", {}) or {}
+    optional_path = optional_det.get("path")
+    optional_present = bool(optional_det.get("present"))
+    if report.get("ok"):
+        try:
+            data = bundle_manifest.load_manifest(path)
+            for item in data["files"]:
+                rel = item["path"]
+                if rel == optional_path and not optional_present:
+                    continue  # optional kards_det missing is not a sync blocker
+                try: blob = (root / rel).read_bytes()
+                except OSError as exc:
+                    errors.append(f"bundle:read:{rel}:{type(exc).__name__}")
+                    continue
+                if len(blob) != item["size"] or sha(blob) != item["sha256"]:
+                    errors.append(f"bundle:changed_during_read:{rel}")
+                    continue
+                files[rel] = blob
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            errors.append(f"bundle:manifest_reload:{type(exc).__name__}")
+    summary = {key: report.get(key) for key in
+               ("file_count", "total_bytes", "manifest_fingerprint", "required",
+                "optional", "capabilities", "components", "warnings")}
+    summary.update({"enabled": True, "manifest": str(path),
+                    "ok": bool(report.get("ok")) and not errors,
+                    "errors": list(dict.fromkeys(list(report.get("errors", [])) +
+                                                 [reason.removeprefix("bundle:") for reason in errors]))})
+    return path, summary, files, errors
+
+
+def should_backup(rel, bundle_paths):
+    return rel in bundle_paths or not set(Path(rel).parts) & SKIP
+
+
+def reparse_chain(path):
+    cur, chain = Path(path), []
+    while True:
+        chain.append(cur)
+        if cur.parent == cur: break
+        cur = cur.parent
+    return next((str(item) for item in reversed(chain) if reparse(item)), None)
+
+
+def existing_ancestor(path):
+    cur = Path(path)
+    while not cur.exists() and not reparse(cur):
+        if cur.parent == cur: break
+        cur = cur.parent
+    return cur
+
+
+def backup_preflight(backup_root, work, targets, target_reports, bundle_paths):
+    """Stat-only backup root and free-space check; never reads config files."""
+    base = Path(backup_root)
+    result = {"root": str(base), "work": str(work), "margin_bytes": BACKUP_SPACE_MARGIN,
+              "backup_bytes": 0, "free_bytes": None, "required_bytes": None,
+              "existing_ancestor": None, "ok": False, "reasons": []}
+    reasons = result["reasons"]
+    if not base.is_absolute(): reasons.append("backup_root_not_absolute")
+    bad = reparse_chain(base)
+    if bad: reasons.append(f"backup_root_reparse:{bad}")
+    anchor = existing_ancestor(base)
+    result["existing_ancestor"] = str(anchor)
+    if anchor.exists() and not anchor.is_dir(): reasons.append("backup_root_not_directory")
+    for target, tr in zip(targets, target_reports):
+        for change in tr["changes"]:
+            rel = change["path"]
+            if change["target_sha256"] is None or not should_backup(rel, bundle_paths):
+                continue
+            try: result["backup_bytes"] += (target / rel).stat().st_size
+            except OSError: reasons.append(f"backup_source_unreadable:{rel}")
+    result["required_bytes"] = result["backup_bytes"] + BACKUP_SPACE_MARGIN
+    try: result["free_bytes"] = shutil.disk_usage(anchor).free
+    except OSError as exc: reasons.append(f"backup_space_unavailable:{type(exc).__name__}")
+    if result["free_bytes"] is not None and result["free_bytes"] < result["required_bytes"]:
+        reasons.append(f"backup_space_insufficient:{result['free_bytes']}<{result['required_bytes']}")
+    result["ok"] = not reasons
+    return result
 
 
 def source_tree(root):
@@ -199,6 +301,10 @@ def main(argv=None):
     ap.add_argument("--host-verified", action="store_true", help="formal only; a claim, not proof")
     ap.add_argument("--acceptance-report", type=Path, help="formal evidence: schema-v1 report JSON")
     ap.add_argument("--verified-manifest", type=Path, help="formal evidence: simplified JSON")
+    ap.add_argument("--bundle-manifest", nargs="?", const=True, metavar="PATH",
+                    help="explicit opt-in: verify bundle-manifest.json (or PATH) and include payload")
+    ap.add_argument("--backup-root", type=Path,
+                    help="absolute backup parent (default: system temp)")
     args = ap.parse_args(argv)
     if args.check and args.apply: ap.error("--check and --apply are mutually exclusive")
     if args.host_verified and args.channel != "formal": ap.error("--host-verified is formal-only")
@@ -220,6 +326,17 @@ def main(argv=None):
     except (OSError, ValueError, KeyError, tomllib.TOMLDecodeError) as exc:
         errors.append(f"source_unreadable:{type(exc).__name__}")
         return finish(report, 2, "source unreadable; no file written")
+    bundle_paths = set()
+    if args.bundle_manifest is not None:
+        _, bundle, bundle_files, bundle_errors = bundle_input(root, args.bundle_manifest)
+        bundle_paths = set(bundle_files)
+        report["bundle"] = bundle
+        for rel, data in bundle_files.items():
+            if rel in files: errors.append(f"bundle_path_collision:{rel}")
+            else: files[rel] = data
+        errors.extend(bundle_errors)
+    else:
+        report["bundle"] = {"enabled": False, "reason": "explicit_bundle_flag_not_set"}
     fp, card_error, (scan, scan_at) = fingerprint(files), cards(root), secret_line(root / "__init__.py")
     if card_error: errors.append(card_error)
     if scan != "clean":
@@ -230,6 +347,12 @@ def main(argv=None):
         tr, bad = inspect(files, target, expected), bad_chain(local, target)
         if bad: tr["issues"].append(f"reparse_point:{bad}")
         report["targets"].append(tr)
+    backup_base = args.backup_root or Path(tempfile.gettempdir())
+    work = backup_base / f"neko-kards-sync-{args.channel}-{datetime.now():%Y%m%d-%H%M%S}"
+    preflight = backup_preflight(backup_base, work, targets, report["targets"], bundle_paths)
+    report["backup_preflight"] = preflight
+    if apply and not preflight["ok"]:
+        errors.extend(f"backup_preflight:{reason}" for reason in preflight["reasons"])
     gate, ev_path = report["formal_gate"], args.acceptance_report or args.verified_manifest
     if args.channel == "formal":
         if not args.host_verified: gate["reasons"].append("host_verified_flag_missing")
@@ -262,13 +385,12 @@ def main(argv=None):
                     errors.append(f"target_backup_scan:{change['path']}:{line}:{status}")
     if errors:
         return finish(report, 2, "backup refused; no target file was written")
-    work = Path(tempfile.gettempdir()) / f"neko-kards-sync-{args.channel}-{datetime.now():%Y%m%d-%H%M%S}"
     report["backup"] = []
     for target, tr in zip(targets, report["targets"]):
         label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(target.relative_to(local)))
         for change in tr["changes"]:
             rel = change["path"]
-            if change["target_sha256"] is not None and not set(Path(rel).parts) & SKIP:
+            if change["target_sha256"] is not None and should_backup(rel, bundle_paths):
                 old = (target / rel).read_bytes()
                 dest = work / "backup" / label / rel
                 dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(old)
