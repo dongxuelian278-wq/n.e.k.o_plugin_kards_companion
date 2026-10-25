@@ -29,6 +29,15 @@ def _install_sdk_stub() -> None:
     if "plugin.sdk.plugin" in sys.modules:
         return
     plugin_pkg = types.ModuleType("plugin")
+    # The real N.E.K.O checkout runs these tests from plugin/plugins/<id>, so
+    # pytest imports the package as plugin.plugins.kards_companion.  Mark the
+    # stub as a package and pre-register the child level; otherwise the stub
+    # replaces the host's ``plugin`` package and the dotted import fails with
+    # "'plugin' is not a package".
+    plugin_pkg.__path__ = []
+    plugins_pkg = types.ModuleType("plugin.plugins")
+    plugins_pkg.__path__ = []
+    plugin_pkg.plugins = plugins_pkg
     sdk_mod = types.ModuleType("plugin.sdk")
     api = types.ModuleType("plugin.sdk.plugin")
 
@@ -50,6 +59,7 @@ def _install_sdk_stub() -> None:
     sdk_mod.plugin = api
     plugin_pkg.sdk = sdk_mod
     sys.modules["plugin"] = plugin_pkg
+    sys.modules["plugin.plugins"] = plugins_pkg
     sys.modules["plugin.sdk"] = sdk_mod
     sys.modules["plugin.sdk.plugin"] = api
 
@@ -60,6 +70,9 @@ if "kards_companion" not in sys.modules:
     package = types.ModuleType("kards_companion")
     package.__path__ = [str(PLUGIN_ROOT)]
     sys.modules["kards_companion"] = package
+
+sys.modules.setdefault("plugin.plugins.kards_companion",
+                       sys.modules["kards_companion"])
 
 # pytest 9 把带 __init__.py 的祖先目录当 Package 节点，setup 时按目录点号
 # 拆分出的 dotted name 导入根 __init__.py；预注册让那次导入直接命中缓存。
