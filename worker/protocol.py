@@ -26,7 +26,7 @@ import json
 import math
 import re
 import time
-from typing import Any, Callable, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 PROTOCOL_VERSION = 1
 PROTOCOL_NAME = "kards-worker-jsonl"

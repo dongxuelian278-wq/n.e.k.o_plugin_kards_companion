@@ -28,8 +28,7 @@ from typing import Any, Iterable, Mapping
 from ..runtime.contracts import (
     CATEGORY_CRITICAL,
     CATEGORY_PRESSURE,
-    CATEGORY_RECOVERY,
-    CATEGORY_TERMINAL,
+    CRITICAL,
     EDGE_RECOVERY,
     EDGE_UPGRADE,
     ENDED,
@@ -37,7 +36,6 @@ from ..runtime.contracts import (
     OPENING,
     OUT_OF_BATTLE,
     PRESSURE,
-    CRITICAL,
     category_allowed,
     event_edge,
     event_identity,

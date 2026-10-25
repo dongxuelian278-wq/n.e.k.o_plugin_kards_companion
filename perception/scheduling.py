@@ -2,7 +2,8 @@
 
 The capture producer is deliberately *not* scheduled here.  Capture is a
 single 20 fps (or user configured) stream; this module only decides whether a
-consumed frame should run the relatively expensive change, HUD or unit tasks.
+consumed frame should run the relatively expensive change, unit or card tasks.
+（HUD OCR 任务已随 OCR 全链路移除，任务集固定为 change/unit/card。）
 
 Design rules
 ------------
@@ -14,6 +15,9 @@ Design rules
   deadline is based on the time a task actually ran.
 * Settings changes are strict.  Unknown keys, wrong types, NaN/infinity and
   out-of-range values are rejected rather than silently clamped.
+* Legacy config keys (``hud_fps``/``ocr_fps``/``roi_auto_calibrate``/
+  ``recording_*``) are ignored on purpose; :func:`legacy_config_warnings`
+  surfaces them so callers can log a warning instead of failing.
 """
 
 from __future__ import annotations
@@ -21,47 +25,68 @@ from __future__ import annotations
 import math
 import numbers
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar, Mapping
 
-TASKS: tuple[str, ...] = ("change", "hud", "unit")
+TASKS: tuple[str, ...] = ("change", "unit", "card")
 VALID_PRESETS: frozenset[str] = frozenset({"low_cost", "balanced", "quality", "custom"})
 
-# (capture, change, HUD, unit) frames per second.
+# (capture, change, unit, card) frames per second.  顺序固定为采集/变化/单位/卡牌，
+# HUD 档位已删除。
 PRESETS: dict[str, tuple[float, float, float, float]] = {
-    "low_cost": (15.0, 8.0, 3.0, 5.0),
-    "balanced": (20.0, 10.0, 4.0, 8.0),
-    "quality": (30.0, 12.0, 5.0, 10.0),
+    "low_cost": (15.0, 8.0, 2.0, 3.0),
+    "balanced": (20.0, 10.0, 4.0, 6.0),
+    "quality": (30.0, 12.0, 6.0, 10.0),
 }
 
 # Inclusive limits.  Every task rate must additionally be <= capture_fps.
 SETTING_LIMITS: dict[str, tuple[float, float]] = {
     "capture_fps": (1.0, 30.0),
     "change_fps": (0.5, 15.0),
-    "hud_fps": (0.5, 6.0),
     "unit_fps": (0.5, 12.0),
-    "recording_max_mb": (64.0, 65536.0),
+    "card_fps": (0.5, 12.0),
 }
 
-FPS_KEYS: tuple[str, ...] = ("capture_fps", "change_fps", "hud_fps", "unit_fps")
+FPS_KEYS: tuple[str, ...] = ("capture_fps", "change_fps", "unit_fps", "card_fps")
 CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "perception_preset",
         "capture_fps",
         "change_fps",
-        "hud_fps",
         "unit_fps",
-        "recording_enabled",
-        "recording_max_mb",
-        "roi_auto_calibrate",
+        "card_fps",
     }
 )
 
-_FIXED_JPEG_QUALITY = 85
+# 旧配置键：兼容忽略（不再参与任何校验/生效），出现时由调用方记 warning。
+LEGACY_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "hud_fps",
+        "ocr_fps",
+        "roi_auto_calibrate",
+        "auto_calibrate",
+        "roi_mode",
+        "recording_enabled",
+        "recording_max_mb",
+        "recording_max_bytes",
+        "recording_jpeg_quality",
+        "recording_scope",
+    }
+)
 
 
 class SettingsValidationError(ValueError):
     """A settings change was not accepted exactly as supplied."""
+
+
+def legacy_config_warnings(config: Mapping[str, Any] | None) -> list[str]:
+    """列出配置里出现但已被移除的旧键（供调用方记录 warning）。"""
+    if not isinstance(config, Mapping):
+        return []
+    nested = config.get("kards")
+    raw: Mapping[str, Any] = nested if isinstance(nested, Mapping) else config
+    found = sorted(set(raw) & LEGACY_CONFIG_KEYS)
+    return [f"legacy_key_ignored:{key}" for key in found]
 
 
 def _number(value: Any, key: str) -> float:
@@ -71,12 +96,6 @@ def _number(value: Any, key: str) -> float:
     if not math.isfinite(result):
         raise SettingsValidationError(f"{key} must be finite")
     return result
-
-
-def _integer(value: Any, key: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
-        raise SettingsValidationError(f"{key} must be an integer")
-    return int(value)
 
 
 def _boolean(value: Any, key: str) -> bool:
@@ -104,8 +123,6 @@ def _validate_fps(value: Any, key: str) -> float:
         raise SettingsValidationError(
             f"{key} must be between {_fmt(lower)} and {_fmt(upper)}"
         )
-    # A whole-number float is still a valid rate; only the storage type for the
-    # recording budget is integer-only.
     return result
 
 
@@ -116,13 +133,13 @@ def _fmt(value: float) -> str:
 def _check_task_rates(
     capture_fps: float,
     change_fps: float,
-    hud_fps: float,
     unit_fps: float,
+    card_fps: float,
 ) -> None:
     for key, value in (
         ("change_fps", change_fps),
-        ("hud_fps", hud_fps),
         ("unit_fps", unit_fps),
+        ("card_fps", card_fps),
     ):
         if value > capture_fps:
             raise SettingsValidationError(
@@ -150,23 +167,19 @@ class _HybridValidateChanges:
 
 @dataclass(frozen=True)
 class PerceptionSettings:
-    """Validated perception cadence/recording policy.
+    """Validated perception cadence policy (capture/change/unit/card).
 
     ``preset='custom'`` is the only way to retain rates that do not match one
     of the three named preset tuples.  Constructing a named preset with a
     non-default rate tuple auto-selects custom instead of lying about the
-    active preset.
+    active preset.  录像与 ROI 校验字段已随对应功能删除。
     """
 
     preset: str = "balanced"
     capture_fps: float = 20.0
     change_fps: float = 10.0
-    hud_fps: float = 4.0
-    unit_fps: float = 8.0
-    recording_enabled: bool = False
-    recording_max_mb: int = 2048
-    recording_jpeg_quality: int = _FIXED_JPEG_QUALITY
-    roi_auto_calibrate: bool = True
+    unit_fps: float = 4.0
+    card_fps: float = 6.0
     evidence_enabled: bool = True
 
     PRESETS: ClassVar[dict[str, tuple[float, float, float, float]]] = PRESETS
@@ -177,25 +190,11 @@ class PerceptionSettings:
         preset = _preset(self.preset)
         capture = _validate_fps(self.capture_fps, "capture_fps")
         change = _validate_fps(self.change_fps, "change_fps")
-        hud = _validate_fps(self.hud_fps, "hud_fps")
         unit = _validate_fps(self.unit_fps, "unit_fps")
-        recording_enabled = _boolean(self.recording_enabled, "recording_enabled")
-        recording_max_mb = _integer(self.recording_max_mb, "recording_max_mb")
-        lower, upper = SETTING_LIMITS["recording_max_mb"]
-        if not lower <= recording_max_mb <= upper:
-            raise SettingsValidationError(
-                "recording_max_mb must be an integer between "
-                f"{int(lower)} and {int(upper)}"
-            )
-        quality = _integer(self.recording_jpeg_quality, "recording_jpeg_quality")
-        if quality != _FIXED_JPEG_QUALITY:
-            raise SettingsValidationError(
-                f"recording_jpeg_quality is fixed at {_FIXED_JPEG_QUALITY}"
-            )
-        roi_auto = _boolean(self.roi_auto_calibrate, "roi_auto_calibrate")
+        card = _validate_fps(self.card_fps, "card_fps")
         evidence = _boolean(self.evidence_enabled, "evidence_enabled")
 
-        values = (capture, change, hud, unit)
+        values = (capture, change, unit, card)
         balanced = PRESETS["balanced"]
         if preset in PRESETS:
             expected = PRESETS[preset]
@@ -203,23 +202,19 @@ class PerceptionSettings:
                 if _same_rates(values, balanced) and preset != "balanced":
                     # Constructing ``PerceptionSettings(preset='low_cost')``
                     # applies that preset's rates; callers need not repeat them.
-                    capture, change, hud, unit = expected
+                    capture, change, unit, card = expected
                 else:
                     # Explicit advanced rates are never silently rounded back
                     # into a named preset.
                     preset = "custom"
 
-        _check_task_rates(capture, change, hud, unit)
+        _check_task_rates(capture, change, unit, card)
 
         object.__setattr__(self, "preset", preset)
         object.__setattr__(self, "capture_fps", capture)
         object.__setattr__(self, "change_fps", change)
-        object.__setattr__(self, "hud_fps", hud)
         object.__setattr__(self, "unit_fps", unit)
-        object.__setattr__(self, "recording_enabled", recording_enabled)
-        object.__setattr__(self, "recording_max_mb", recording_max_mb)
-        object.__setattr__(self, "recording_jpeg_quality", quality)
-        object.__setattr__(self, "roi_auto_calibrate", roi_auto)
+        object.__setattr__(self, "card_fps", card)
         object.__setattr__(self, "evidence_enabled", evidence)
 
     @property
@@ -232,8 +227,8 @@ class PerceptionSettings:
         return {
             "capture_fps": self.capture_fps,
             "change_fps": self.change_fps,
-            "hud_fps": self.hud_fps,
             "unit_fps": self.unit_fps,
+            "card_fps": self.card_fps,
         }
 
     def fps_for(self, task: str) -> float:
@@ -246,20 +241,15 @@ class PerceptionSettings:
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly snapshot using config-key names.
 
-        The two fixed values (JPEG quality/evidence) are included for
-        diagnostics.  They are intentionally not accepted by
-        :meth:`validate_changes`; there is no UI control for either.
+        ``evidence_enabled`` 是固定诊断位，不在 :meth:`validate_changes` 的
+        白名单里；旧 hud/recording/roi 键不再出现。
         """
         return {
             "perception_preset": self.preset,
             "capture_fps": self.capture_fps,
             "change_fps": self.change_fps,
-            "hud_fps": self.hud_fps,
             "unit_fps": self.unit_fps,
-            "recording_enabled": self.recording_enabled,
-            "recording_max_mb": self.recording_max_mb,
-            "recording_jpeg_quality": self.recording_jpeg_quality,
-            "roi_auto_calibrate": self.roi_auto_calibrate,
+            "card_fps": self.card_fps,
             "evidence_enabled": self.evidence_enabled,
         }
 
@@ -268,12 +258,14 @@ class PerceptionSettings:
         """Build settings from a (possibly full/nested) config mapping.
 
         Unrelated config keys are ignored because callers often pass the whole
-        plugin config.  Legacy ``perf_mode`` is honoured when no explicit
-        preset or task-rate edits are present; new settings always win.
-        ``capture_fps`` is special because the legacy config used that same
-        key: a pure legacy ``perf_mode`` mapping keeps its old capture rate out
-        of the new schedule, while a config carrying ``perception_preset``
-        treats capture_fps as an explicit new-setting edit.
+        plugin config; removed legacy keys (hud/ocr/roi/recording) likewise
+        never influence the result.  Legacy ``perf_mode`` is honoured when no
+        explicit preset or task-rate edits are present; new settings always
+        win.  ``capture_fps`` is special because the legacy config used that
+        same key: a pure legacy ``perf_mode`` mapping keeps its old capture
+        rate out of the new schedule, while a config carrying
+        ``perception_preset`` treats capture_fps as an explicit new-setting
+        edit.
         """
         if config is None:
             return cls()
@@ -296,13 +288,13 @@ class PerceptionSettings:
                 preset = "balanced"
 
         if preset in PRESETS:
-            capture, change, hud, unit = PRESETS[preset]
+            capture, change, unit, card = PRESETS[preset]
         else:
-            capture, change, hud, unit = (
+            capture, change, unit, card = (
                 float(cls.capture_fps),
                 float(cls.change_fps),
-                float(cls.hud_fps),
                 float(cls.unit_fps),
+                float(cls.card_fps),
             )
 
         # ``capture_fps`` existed in the legacy config too.  A legacy
@@ -329,8 +321,8 @@ class PerceptionSettings:
                     supplied_rates[key] = _validate_fps(raw[key], key)
             capture = supplied_rates.get("capture_fps", capture)
             change = supplied_rates.get("change_fps", change)
-            hud = supplied_rates.get("hud_fps", hud)
             unit = supplied_rates.get("unit_fps", unit)
+            card = supplied_rates.get("card_fps", card)
             if preset in PRESETS:
                 if not all(
                     key not in supplied_rates
@@ -339,28 +331,12 @@ class PerceptionSettings:
                 ):
                     preset = "custom"
 
-        recording_enabled = _boolean(
-            raw.get("recording_enabled", cls.recording_enabled),
-            "recording_enabled",
-        )
-        recording_max_mb = _integer(
-            raw.get("recording_max_mb", cls.recording_max_mb),
-            "recording_max_mb",
-        )
-        roi_auto = _boolean(
-            raw.get("roi_auto_calibrate", cls.roi_auto_calibrate),
-            "roi_auto_calibrate",
-        )
-
         return cls(
             preset=preset,
             capture_fps=capture,
             change_fps=change,
-            hud_fps=hud,
             unit_fps=unit,
-            recording_enabled=recording_enabled,
-            recording_max_mb=recording_max_mb,
-            roi_auto_calibrate=roi_auto,
+            card_fps=card,
         )
 
     validate_changes = _HybridValidateChanges()
@@ -373,9 +349,11 @@ class PerceptionSettings:
     ) -> dict[str, Any]:
         """Validate an exact UI/config change set and return its effect.
 
-        Unknown keys and fixed/read-only fields are rejected.  Any advanced
-        rate edit selects ``custom``.  When a named preset is selected the
-        returned mapping includes all four resolved rates, making it safe to
+        Unknown keys and fixed/read-only fields are rejected; removed legacy
+        keys (hud/ocr/roi/recording) count as unknown here so callers surface
+        the removal instead of silently dropping the edit.  Any advanced rate
+        edit selects ``custom``.  When a named preset is selected the returned
+        mapping includes all four resolved rates, making it safe to
         persist/merge without relying on a later fallback.
         """
         if not isinstance(changes, Mapping):
@@ -397,7 +375,6 @@ class PerceptionSettings:
                 "current must be PerceptionSettings, a mapping, or None"
             )
 
-        result: dict[str, Any] = {}
         preset_value: str | None = None
         if "perception_preset" in changes:
             preset_value = _preset(changes["perception_preset"])
@@ -407,53 +384,35 @@ class PerceptionSettings:
             if key in changes:
                 fps_changes[key] = _validate_fps(changes[key], key)
 
-        if "recording_enabled" in changes:
-            result["recording_enabled"] = _boolean(
-                changes["recording_enabled"], "recording_enabled"
-            )
-        if "recording_max_mb" in changes:
-            value = _integer(changes["recording_max_mb"], "recording_max_mb")
-            lower, upper = SETTING_LIMITS["recording_max_mb"]
-            if not lower <= value <= upper:
-                raise SettingsValidationError(
-                    "recording_max_mb must be an integer between "
-                    f"{int(lower)} and {int(upper)}"
-                )
-            result["recording_max_mb"] = value
-        if "roi_auto_calibrate" in changes:
-            result["roi_auto_calibrate"] = _boolean(
-                changes["roi_auto_calibrate"], "roi_auto_calibrate"
-            )
-
         schedule_touched = preset_value is not None or bool(fps_changes)
         if not schedule_touched:
-            return result
+            return {}
 
         if preset_value is not None:
             if preset_value in PRESETS:
-                capture, change, hud, unit = PRESETS[preset_value]
+                capture, change, unit, card = PRESETS[preset_value]
             else:
-                capture, change, hud, unit = (
+                capture, change, unit, card = (
                     base.capture_fps,
                     base.change_fps,
-                    base.hud_fps,
                     base.unit_fps,
+                    base.card_fps,
                 )
             resulting_preset = preset_value
         else:
-            capture, change, hud, unit = (
+            capture, change, unit, card = (
                 base.capture_fps,
                 base.change_fps,
-                base.hud_fps,
                 base.unit_fps,
+                base.card_fps,
             )
             resulting_preset = "custom"
 
         values = {
             "capture_fps": capture,
             "change_fps": change,
-            "hud_fps": hud,
             "unit_fps": unit,
+            "card_fps": card,
         }
         values.update(fps_changes)
 
@@ -470,11 +429,11 @@ class PerceptionSettings:
         _check_task_rates(
             values["capture_fps"],
             values["change_fps"],
-            values["hud_fps"],
             values["unit_fps"],
+            values["card_fps"],
         )
 
-        result["perception_preset"] = resulting_preset
+        result: dict[str, Any] = {"perception_preset": resulting_preset}
         result.update(values)
         return result
 
@@ -495,6 +454,8 @@ class _TaskState:
     last_accepted_at: float | None = None
     next_deadline: float | None = None
     durations: list[float] | None = None
+    # 实测频率的滚动窗口：最近若干次接受时刻，span/次数 → measured fps。
+    accepted_history: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.durations is None:
@@ -502,7 +463,7 @@ class _TaskState:
 
 
 class PerceptionScheduler:
-    """Independent change/HUD/unit deadlines over a shared capture stream.
+    """Independent change/unit/card deadlines over a shared capture stream.
 
     ``due(task, now=None, frame_id=None)`` only reads the injected clock and
     never calls wall-clock time.  Supplying a frame id is recommended: the
@@ -511,6 +472,7 @@ class PerceptionScheduler:
     """
 
     MAX_DURATIONS = 64
+    MAX_ACCEPTED_HISTORY = 32
 
     def __init__(
         self,
@@ -617,6 +579,9 @@ class PerceptionScheduler:
         state.actual += 1
         state.last_accepted_at = current
         state.next_deadline = current + interval
+        state.accepted_history.append(current)
+        if len(state.accepted_history) > self.MAX_ACCEPTED_HISTORY:
+            del state.accepted_history[: len(state.accepted_history) - self.MAX_ACCEPTED_HISTORY]
         if frame_id is not None:
             state.last_frame_id = frame_id
             state.has_frame_id = True
@@ -633,6 +598,21 @@ class PerceptionScheduler:
         durations.append(duration)
         if len(durations) > self.MAX_DURATIONS:
             del durations[: len(durations) - self.MAX_DURATIONS]
+
+    @staticmethod
+    def _measured_fps(state: _TaskState) -> float | None:
+        """滚动窗口实测频率：窗口内 (次数-1) / 时间跨度。"""
+        history = state.accepted_history
+        if len(history) < 2:
+            return None
+        span = history[-1] - history[0]
+        if span <= 0.0:
+            return None
+        return round((len(history) - 1) / span, 3)
+
+    def measured_fps(self) -> dict[str, float | None]:
+        """{task: 实测Hz}，供状态面 fps_measured（与目标值并列展示）。"""
+        return {task: self._measured_fps(state) for task, state in self._tasks.items()}
 
     def next_deadline(self, task: str) -> float | None:
         return self._tasks[self._validate_task(task)].next_deadline
@@ -653,6 +633,7 @@ class PerceptionScheduler:
                 "fps": self._settings.fps_for(task),
                 "actual": state.actual,
                 "missed": state.missed,
+                "measured_fps": self._measured_fps(state),
                 "durations": [round(value, 6) for value in durations],
                 "durations_ms": duration_ms,
                 "last_duration_ms": duration_ms[-1] if duration_ms else None,
@@ -679,6 +660,7 @@ class PerceptionScheduler:
             "actual": {task: tasks[task]["actual"] for task in TASKS},
             "missed": {task: tasks[task]["missed"] for task in TASKS},
             "durations": {task: tasks[task]["durations"] for task in TASKS},
+            "measured_fps": {task: tasks[task]["measured_fps"] for task in TASKS},
             "totals": {
                 "actual": total_actual,
                 "missed": total_missed,

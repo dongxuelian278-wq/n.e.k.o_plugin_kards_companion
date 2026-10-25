@@ -1,7 +1,8 @@
-"""YOLO11n ONNX 检测 + numpy 后处理（Python 3.11；宿主 onnxruntime 仅 CPU）。
+"""检测后处理 + 轨迹跟踪（Python 3.11；宿主 onnxruntime 仅 CPU）。
 
-类别 id 与 training/dataset.yaml 严格一致：
-    0 unit_board  1 card_hand  2 card_back  3 played_card  4 hq  5 frontline  6 end_turn_button
+类别表不再内嵌：检测类别由 ui_classes.json（10 类 v1）在
+``perception.models.UiDetector`` 加载时注入；本模块只提供与类别无关的
+letterbox/NMS/轨迹逻辑，不存在任何按固定七类读取或截断输出通道的路径。
 """
 
 import copy as _copy
@@ -24,14 +25,9 @@ from ..state.model import (
     BoardUnit,
 )
 
-CLASS_NAMES = ("unit_board", "card_hand", "card_back", "played_card",
-               "hq", "frontline", "end_turn_button")
-CLASS_TO_ID = {name: index for index, name in enumerate(CLASS_NAMES)}
-
-_CONF_THRESHOLD = 0.30
 _IOU_NMS = 0.45
 _IOU_TRACK = 0.30
-_TRACK_GRACE = 2  # 单位框消失几帧内不清除（hud_reader 要补数字）
+_TRACK_GRACE = 2  # 单位框消失几帧内不清除（旧 HUD 补数字已移除，保留宽限避免闪烁）
 
 # ---------------------------------------------------------------- 轨迹确认
 # 已批准方案：登场 2 帧、合法移动 2 帧、缺失 3 帧只记 unit_lost 诊断。
@@ -253,50 +249,9 @@ def nms(detections: list[Detection], threshold: float = _IOU_NMS) -> list[Detect
     return kept
 
 
-class YoloDetector:
-    """加载 kards_det.onnx，输出原图坐标系检测框。"""
-
-    def __init__(self, onnx_path: str, *, imgsz: int = 640) -> None:
-        import onnxruntime as ort
-        self._session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-        self._input_name = self._session.get_inputs()[0].name
-        shape = self._session.get_inputs()[0].shape
-        self._imgsz = int(shape[2]) if isinstance(shape[2], int) and shape[2] > 0 else imgsz
-        self.last_ms = 0.0
-
-    def detect(self, image: Image.Image) -> list[Detection]:
-        started = time.perf_counter()
-        blob, scale, pad_x, pad_y = letterbox(image, self._imgsz)
-        raw = self._session.run(None, {self._input_name: blob})[0]
-        self.last_ms = (time.perf_counter() - started) * 1000.0
-        return self._postprocess(np.asarray(raw), scale, pad_x, pad_y)
-
-    def _postprocess(self, out: np.ndarray, scale: float, pad_x: int, pad_y: int) -> list[Detection]:
-        # ultralytics 导出布局 (1, 4+n_cls, n_anchors)；按维度是否等于 4+n_cls 定向
-        if out.ndim == 3:
-            out = out[0]
-        expected = 4 + len(CLASS_NAMES)
-        if out.shape[0] == expected and out.shape[1] != expected:
-            out = out.T
-        if out.shape[1] < expected:
-            return []
-        boxes_xywh = out[:, :4]
-        class_scores = out[:, 4:]
-        confs = class_scores.max(axis=1)
-        cls_ids = class_scores.argmax(axis=1)
-        mask = confs >= _CONF_THRESHOLD
-        detections: list[Detection] = []
-        for i in np.nonzero(mask)[0]:
-            cx, cy, w, h = boxes_xywh[i]
-            x1 = (cx - w / 2 - pad_x) / scale
-            y1 = (cy - h / 2 - pad_y) / scale
-            x2 = (cx + w / 2 - pad_x) / scale
-            y2 = (cy + h / 2 - pad_y) / scale
-            cid = int(cls_ids[i])
-            if cid >= len(CLASS_NAMES):
-                continue
-            detections.append(Detection(cid, CLASS_NAMES[cid], float(confs[i]), x1, y1, x2, y2))
-        return nms(detections)
+# 模型加载与 ultralytics 检测张量后处理见 perception/models.py 的
+# UiDetector/postprocess_detect（类别表由 ui_classes.json 注入）。旧
+# 七类 YoloDetector 加载点已随 OCR/录像链路一并移除。
 
 
 # ---------------------------------------------------------------- 分行归属

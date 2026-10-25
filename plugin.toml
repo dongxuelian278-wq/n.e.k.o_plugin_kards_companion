@@ -1,10 +1,10 @@
 [plugin]
 id = "kards_companion"
 name = "KARDS 猫娘陪玩"
-description = "被动读取 KARDS 游戏画面，得到结构化对局状态与单位履历，按事件优先级与可调节奏做陪伴解说。读屏观战，不读内存、不抓包、不代操作。"
-short_description = "KARDS screen-reading companion: structured match state, priority-aware catgirl commentary."
+description = "被动读取 KARDS 游戏画面，得到结构化对局状态与单位履历，按事件优先级与可调节奏做陪伴解说。读屏观战，不读内存、不抓包、不代操作。测试版：当前只验证卡背与结束回合按钮定位，具体卡牌识别白名单为空，卡名与单位身份仍显示未知。"
+short_description = "KARDS screen-reading companion (test build): card-back and end-turn-button detection; card identity not yet enabled."
 keywords = ["KARDS", "卡牌游戏", "游戏陪玩", "观战", "二战"]
-version = "6.0.0"
+version = "6.1.0"
 type = "plugin"
 entry = "plugin.plugins.kards_companion:KardsCompanionPlugin"
 passive = true
@@ -41,21 +41,16 @@ mode = "companion"
 perf_mode = "realtime"
 tick_ms = 333
 # 采样预设：low_cost / balanced / quality / custom（custom 时才以四项单项值为准）
-# 预设值依次为 采集 / 变化检测 / HUD OCR / 单位跟踪 FPS：
-#   low_cost=15/8/3/5  balanced=20/10/4/8  quality=30/12/5/10
+# 预设值依次为 采集 / 变化检测 / 单位跟踪 / 卡牌分类 FPS：
+#   low_cost=15/8/2/3  balanced=20/10/4/6  quality=30/12/6/10
+# 旧键 hud_fps / roi_auto_calibrate / recording_* 已随 OCR 与录像功能移除，出现时忽略并告警
 perception_preset = "balanced"
 capture_fps = 20
 change_fps = 10
-hud_fps = 4
-unit_fps = 8
+unit_fps = 4
+card_fps = 6
 # 兼容旧字段；新预设/单项设置优先生效
 capture_fps_power_saver = 4
-# 客户区 ROI 自动校准；默认开（只接受高置信 frontline/end_turn/hq 锚点）
-roi_auto_calibrate = true
-# 局内临时帧录制：默认关闭；JPEG 85；原始分辨率；滚动覆盖
-recording_enabled = false
-# 2GiB；UI/动作可在 64..65536 MiB（64GB）之间调整
-recording_max_mb = 2048
 # 启动后自动开始监控（显式保留旧习惯；设 false 则需面板手动开始）
 auto_start_monitoring = true
 # 事件解说节流

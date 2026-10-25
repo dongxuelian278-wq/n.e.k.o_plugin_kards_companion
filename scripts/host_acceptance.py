@@ -8,8 +8,19 @@ Only --launch-host starts the verified exe (wait <= 60s).  The bridge token is u
 in memory for one 401/403 retry and is never reported or persisted.  Python 3.11+.
 """
 
-import argparse, hashlib, json, os, re, socket, subprocess, sys, time, tomllib
-import urllib.error, urllib.parse, urllib.request
+import argparse
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -201,7 +212,10 @@ def inspect_entry(root, entry):
     if source is None:
         return {"source_file": None, "entries": [], "ui_actions": [], "llm_tools": [], "reason": "entry_file_not_found"}
     text = source.read_text(encoding="utf-8", errors="replace")
-    grab = lambda pattern: sorted(set(re.findall(pattern, text)))
+
+    def grab(pattern: str) -> list[str]:
+        return sorted(set(re.findall(pattern, text)))
+
     return {"source_file": str(source), "source_sha256_16": hashlib.sha256(source.read_bytes()).hexdigest()[:16],
             "entries": grab(r'@plugin_entry\(\s*id\s*=\s*"([^"]+)"'),
             "ui_actions": grab(r'@ui\.action\(\s*id\s*=\s*"([^"]+)"'),

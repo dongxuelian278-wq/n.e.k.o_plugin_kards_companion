@@ -34,6 +34,43 @@ LANE_FRONT = "front"
 POSITION_HISTORY_LIMIT = 20
 EVIDENCE_FRAME_LIMIT = 4
 
+# Volatile keys excluded from semantic fingerprints.  This is the single
+# shared specification: delivery.publisher may import :func:`semantic_value`
+# instead of maintaining a second recursive normalizer.
+SEMANTIC_VOLATILE_KEYS = frozenset({
+    "detected_at", "observed_at", "ui_observed_at", "captured_at", "ts",
+    "frame_id", "source_frame", "last_seen_frame", "first_seen_frame", "seq",
+    "age_ms", "source_age_ms", "ui_age_ms", "built_at", "published_at",
+    "expires_at", "next_expire_at", "last_seen_at", "first_seen_at",
+    "duration_ms", "last_ms", "next_in_ms", "age_s",
+})
+
+
+def semantic_value(value: Any) -> Any:
+    """Recursively normalize a public payload for semantic comparison.
+
+    Volatile timestamps/frame ids/ages are dropped, mappings are key-sorted and
+    tuples become lists.  Functional changes (capability boundaries, observed
+    false, units, cards) are preserved and therefore change the fingerprint.
+    """
+    if isinstance(value, dict):
+        return {
+            str(key): semantic_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in SEMANTIC_VOLATILE_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [semantic_value(item) for item in value]
+    return value
+
+
+def semantic_fingerprint(value: Any) -> str:
+    """Stable SHA-256 over :func:`semantic_value` (JSON-safe by construction)."""
+    encoded = json.dumps(
+        semantic_value(value), ensure_ascii=True, sort_keys=True,
+        separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
 # ---------------------------------------------------------------- 事件定义
 
 E_MATCH_START = "match_start"
@@ -138,8 +175,8 @@ class BoardUnit:
         }
         if self.cost is not None:
             out["cost"] = self.cost
-        # Only trajectory-produced units add position metadata; legacy
-        # constructors keep the exact previous public shape.
+        # Legacy constructors keep the exact previous public shape unless they
+        # already supplied position metadata.
         if self.slot is not None:
             out["slot"] = int(self.slot)
         if self.bbox is not None:
@@ -147,7 +184,31 @@ class BoardUnit:
                 out["bbox"] = [round(float(v), 4) for v in self.bbox]
             except (TypeError, ValueError):
                 pass
-        if known:
+        if self.trajectory:
+            # Trajectory units always carry observation provenance.  A unit
+            # that was not observed on the current valid frame is retained
+            # history: its identity must never read as the current board.
+            observed = bool(self.observed)
+            out["observed"] = observed
+            out["current"] = observed
+            out["last_seen_frame"] = (
+                int(self.last_seen_frame)
+                if self.last_seen_frame is not None else None)
+            out["observed_at"] = round(float(self.observed_at or 0.0), 3)
+            out["detection_conf"] = round(
+                float(self.detection_confidence or 0.0), 3)
+            out["track_confirmed"] = bool(self.track_confirmed)
+            if known:
+                if observed:
+                    out["name"] = self.card_name
+                    out["card"] = self.card_id
+                else:
+                    out["last_known_name"] = self.card_name
+                    if self.card_id:
+                        out["last_known_card"] = self.card_id
+            elif observed:
+                out["desc"] = self.describe()
+        elif known:
             out["name"] = self.card_name
             out["card"] = self.card_id
         else:
@@ -171,7 +232,9 @@ class MatchState:
     scene: str = SCENE_UNKNOWN
     game_number: int = 0
     in_match: bool = False
-    my_turn: bool = False
+    # Tri-state: True/False only from an explicit, trustworthy turn signal.
+    # None means unknown/unobserved and must never be coerced to False.
+    my_turn: bool | None = None
     turn_number: int = 0
     my_hq: int | None = None
     enemy_hq: int | None = None
@@ -190,12 +253,15 @@ class MatchState:
     detected_at: float = field(default_factory=time.time)
     # 竞技场/轮抓未支持标记
     draft_unsupported: bool = False
+    # Unified read/respond/tool view (``runtime.situation.build_situation``).
+    # Empty keeps every legacy public shape byte-compatible.
+    situation: dict[str, Any] = field(default_factory=dict)
 
     def units_of(self, side: str) -> list[BoardUnit]:
         return [u for u in self.units if u.side == side]
 
     def to_public_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "in_match": self.in_match,
             "my_turn": self.my_turn,
             "turn": self.turn_number,
@@ -209,11 +275,19 @@ class MatchState:
             "last_order": self.last_order_card,
             "game_number": self.game_number,
         }
+        # Legacy callers built states without a situation view; do not add the
+        # key until a real per-tick view exists.
+        if self.situation:
+            payload["situation"] = self.situation
+        return payload
 
     def semantic_fingerprint(self) -> str:
-        payload = {k: v for k, v in self.to_public_dict().items() if k != "detected_at"}
-        encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
-        return hashlib.sha256(encoded).hexdigest()
+        """Shared semantic hash (same normalizer as delivery.publisher).
+
+        Volatile frame/time/age fields are excluded; capability changes and
+        ``observed=false`` transitions remain functional and change the hash.
+        """
+        return semantic_fingerprint(self.to_public_dict())
 
 
 @dataclass

@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv311/
 venv/
 env/
 
@@ -17,9 +18,9 @@ data/
 records/
 outputs/
 *.log
+store.db
 
 # Model weights and exported ONNX are not part of the source tree
-models/*.onnx
 models/*.pt
 models/*.pth
 models/*.onnx.data

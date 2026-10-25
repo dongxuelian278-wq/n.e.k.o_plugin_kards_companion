@@ -8,22 +8,24 @@ Scope (phase 1)
 * Read the single authoritative distribution manifest, ``bundle-manifest.json``
   (schema ``neko-kards-bundle-manifest/1``), exactly as produced by
   ``scripts/bundle_manifest.py``.  The worker checks that manifest shape, the
-  payload paths it declares, the required markers, the optional ``kards_det``
-  entry, component metadata, and the manifest fingerprint.
+  payload paths it declares, the required markers, the optional
+  ``kards_ui_det`` / ``kards_card_cls`` model entries, component metadata, and
+  the manifest fingerprint.  The OCR runtime marker and the old ``kards_det``
+  declaration were removed with the OCR pipeline.
 * Read optional ``worker-runtime.json`` (schema ``kards-worker-runtime/1``) for
   the worker's own vendored-Python / dependency / model declarations.  This
   file is *not* a second copy of the distribution manifest and never replaces
   ``bundle-manifest.json``.  When it is absent, the worker reports the bundle
   manifest component entries only and does not invent dependency states.
 * Report a structured, JSON-serializable snapshot of the offline runtime:
-  vendored Python root, optional dependency states, and the ``kards_det``
-  model state.
+  vendored Python root, optional dependency states, and the state of each
+  declared model (``kards_ui_det`` / ``kards_card_cls``).
 * Never create directories, never download, never import the host SDK, and
-  never read user secrets / chat / video / training data.  The only large file
-  this module reads is the declared ``kards_det`` model, and only to verify a
-  checksum that the manifest itself declares.
+  never read user secrets / chat / video / training data.  The only large files
+  this module reads are the declared models, and only to verify a checksum
+  that the manifest itself declares.
 
-A missing ``kards_det`` model is reported as ``missing`` and is never turned
+A missing model is reported as ``missing`` and is never turned
 into ``ready``.  A dependency that is importable from the host/system Python
 but not from the bundle is reported as ``external`` and cannot satisfy the
 offline guarantee.
@@ -57,26 +59,26 @@ CPU_ONLY = True
 WORKER_RUNTIME_FILENAME = "worker-runtime.json"
 DISTRIBUTION_MANIFEST_FILENAME = "bundle-manifest.json"
 ASSETS_MANIFEST_CANDIDATES = ("assets/cards/manifest.json", "assets/manifest.json")
-OCR_RUNTIME_CANDIDATES = (
-    "ocr_models/runtime.json",
-    "worker/models/ocr/runtime.json",
-)
 NOTICE_CANDIDATES = (
     "THIRD_PARTY_NOTICES.md",
     "THIRD_PARTY_NOTICES.txt",
     "THIRD_PARTY_NOTICES",
 )
-BUNDLE_DIRS = ("worker", "vendor", "assets", "models", "ocr_models")
+BUNDLE_DIRS = ("worker", "vendor", "assets", "models")
 REQUIRED_MARKERS = (
     ("python_worker", ("worker/entry.py", "worker/bootstrap.py")),
-    ("ocr_runtime", OCR_RUNTIME_CANDIDATES),
     ("assets_manifest", ASSETS_MANIFEST_CANDIDATES),
     ("third_party_notices", NOTICE_CANDIDATES),
 )
-JSON_REQUIRED_MARKERS = frozenset({"ocr_runtime", "assets_manifest"})
+JSON_REQUIRED_MARKERS = frozenset({"assets_manifest"})
 
-MODEL_ID = "kards_det"
-DEFAULT_MODEL_RELATIVE = "models/kards_det.onnx"
+# 双 YOLO 模型：kards_ui_det（界面检测）/ kards_card_cls（卡牌分类）。
+# 旧 kards_det 声明已删除；模型缺失只降级不阻塞。
+MODEL_IDS = {
+    "kards_ui_det": "models/ui_det.onnx",
+    "kards_card_cls": "models/card_cls.onnx",
+}
+DEFAULT_MODEL_RELATIVE = MODEL_IDS["kards_ui_det"]
 
 VENDOR_ROOT_RELATIVE = "vendor"
 VENDOR_PYTHON_RELATIVE = "vendor/python"
@@ -141,10 +143,10 @@ _FILE_ENTRY_KEYS = frozenset(
 _COMPONENT_META_KEYS = frozenset({"version", "license", "file_count", "size_bytes"})
 _REQUIRED_STATE_KEYS = frozenset({"expected", "path", "present", "size", "sha256"})
 _OPTIONAL_STATE_KEYS = frozenset(
-    {"path", "state", "present", "size", "sha256", "blocks_ocr"}
+    {"path", "state", "present", "size", "sha256"}
 )
 _CAPABILITY_KEYS = frozenset(
-    {"ocr_bundle_ready", "kards_det", "kards_det_blocks_ocr"}
+    {"bundle_ready", "kards_ui_det", "kards_card_cls"}
 )
 _INTEGRITY_KEYS = frozenset({"file_count", "total_bytes", "sha256"})
 
@@ -166,13 +168,12 @@ class BundleLayout:
     worker_runtime_path: Path
     distribution_manifest_path: Path
     assets_manifest_path: Path
-    ocr_runtime_path: Path
     vendor_root: Path
     python_root: Path
     python_exe: Path
     site_packages: Path
     models_dir: Path
-    model_path: Path
+    model_paths: dict
     requirements_path: Path
 
 
@@ -189,7 +190,6 @@ DEFAULT_DEPENDENCIES: tuple[DependencySpec, ...] = (
     DependencySpec("PIL", ("PIL",), True, "image"),
     DependencySpec("cv2", ("cv2",), False, "vision"),
     DependencySpec("onnxruntime", ("onnxruntime",), False, "detector"),
-    DependencySpec("rapidocr", ("rapidocr", "rapidocr_onnxruntime"), False, "ocr"),
 )
 
 
@@ -362,13 +362,15 @@ def resolve_layout(bundle_root: str | Path | None = None) -> BundleLayout:
             DISTRIBUTION_MANIFEST_FILENAME, "distribution_manifest_path"
         ),
         assets_manifest_path=member(ASSETS_MANIFEST_CANDIDATES[0], "assets.manifest_path"),
-        ocr_runtime_path=member(OCR_RUNTIME_CANDIDATES[0], "ocr.runtime_path"),
         vendor_root=member(VENDOR_ROOT_RELATIVE, "vendor_root"),
         python_root=member(VENDOR_PYTHON_RELATIVE, "runtime.python_root"),
         python_exe=member(VENDOR_PYTHON_EXE_RELATIVE, "runtime.python_exe"),
         site_packages=member(VENDOR_SITE_PACKAGES_RELATIVE, "runtime.site_packages"),
         models_dir=member("models", "models_dir"),
-        model_path=member(DEFAULT_MODEL_RELATIVE, "models.kards_det.path"),
+        model_paths={
+            model_id: member(relative, "models.%s.path" % model_id)
+            for model_id, relative in MODEL_IDS.items()
+        },
         requirements_path=member("requirements-bundle.txt", "requirements_bundle"),
     )
 
@@ -1026,7 +1028,7 @@ def _validate_distribution_manifest(
             ),
         )
     else:
-        unknown_optional = sorted(set(optional_data) - {MODEL_ID})
+        unknown_optional = sorted(set(optional_data) - set(MODEL_IDS))
         if unknown_optional:
             _append_issue(
                 issues,
@@ -1037,18 +1039,20 @@ def _validate_distribution_manifest(
                     field="optional",
                 ),
             )
-        raw_optional = optional_data.get(MODEL_ID)
-        if not isinstance(raw_optional, dict):
-            _append_issue(
-                issues,
-                _issue(
-                    "distribution_manifest_field_invalid",
-                    "distribution_manifest",
-                    "optional.kards_det must be an object",
-                    field="optional.kards_det",
-                ),
-            )
-        else:
+        for model_id, model_relative in MODEL_IDS.items():
+            field = "optional.%s" % model_id
+            raw_optional = optional_data.get(model_id)
+            if not isinstance(raw_optional, dict):
+                _append_issue(
+                    issues,
+                    _issue(
+                        "distribution_manifest_field_invalid",
+                        "distribution_manifest",
+                        "%s must be an object" % field,
+                        field=field,
+                    ),
+                )
+                continue
             optional_extra = sorted(set(raw_optional) - _OPTIONAL_STATE_KEYS)
             if optional_extra:
                 _append_issue(
@@ -1056,45 +1060,45 @@ def _validate_distribution_manifest(
                     _issue(
                         "distribution_manifest_field_invalid",
                         "distribution_manifest",
-                        "optional.kards_det has unknown fields: %s" % ", ".join(optional_extra),
-                        field="optional.kards_det",
+                        "%s has unknown fields: %s" % (field, ", ".join(optional_extra)),
+                        field=field,
                     ),
                 )
             path_value = raw_optional.get("path")
-            if path_value != DEFAULT_MODEL_RELATIVE:
+            if path_value != model_relative:
                 _append_issue(
                     issues,
                     _issue(
                         "distribution_manifest_field_invalid",
                         "distribution_manifest",
-                        "optional.kards_det.path must be %r" % DEFAULT_MODEL_RELATIVE,
-                        field="optional.kards_det.path",
+                        "%s.path must be %r" % (field, model_relative),
+                        field=field + ".path",
                     ),
                 )
             else:
                 try:
-                    resolve_member_path(root, path_value, field="optional.kards_det.path")
+                    resolve_member_path(root, path_value, field=field + ".path")
                 except BundlePathError as exc:
                     _append_issue(
                         issues,
                         _issue(
                             "distribution_manifest_unsafe_path",
-                            "model:%s" % MODEL_ID,
+                            "model:%s" % model_id,
                             exc.message,
-                            field="optional.kards_det.path",
+                            field=field + ".path",
                         ),
                     )
             present = raw_optional.get("present")
             if present is True:
-                entry = by_path.get(DEFAULT_MODEL_RELATIVE)
+                entry = by_path.get(model_relative)
                 if entry is None:
                     _append_issue(
                         issues,
                         _issue(
                             "distribution_manifest_field_invalid",
                             "distribution_manifest",
-                            "optional.kards_det is present but not listed in files",
-                            field="optional.kards_det",
+                            "%s is present but not listed in files" % field,
+                            field=field,
                         ),
                     )
                 elif (
@@ -1107,25 +1111,23 @@ def _validate_distribution_manifest(
                         _issue(
                             "distribution_manifest_field_invalid",
                             "distribution_manifest",
-                            "optional.kards_det size/sha256/state do not match the file entry",
-                            field="optional.kards_det",
+                            "%s size/sha256/state do not match the file entry" % field,
+                            field=field,
                         ),
                     )
                 else:
-                    optional_view[MODEL_ID] = {
-                        "path": DEFAULT_MODEL_RELATIVE,
+                    optional_view[model_id] = {
+                        "path": model_relative,
                         "state": "present",
                         "present": True,
                         "size": entry.size,
                         "sha256": entry.sha256,
-                        "blocks_ocr": False,
                     }
             elif present is False and raw_optional.get("state") == "missing":
-                optional_view[MODEL_ID] = {
-                    "path": DEFAULT_MODEL_RELATIVE,
+                optional_view[model_id] = {
+                    "path": model_relative,
                     "state": "missing",
                     "present": False,
-                    "blocks_ocr": False,
                 }
             else:
                 _append_issue(
@@ -1133,8 +1135,8 @@ def _validate_distribution_manifest(
                     _issue(
                         "distribution_manifest_field_invalid",
                         "distribution_manifest",
-                        "optional.kards_det.present/state is invalid",
-                        field="optional.kards_det",
+                        "%s.present/state is invalid" % field,
+                        field=field,
                     ),
                 )
 
@@ -1161,27 +1163,27 @@ def _validate_distribution_manifest(
                     field="capabilities",
                 ),
             )
-        for key_name in ("ocr_bundle_ready", "kards_det_blocks_ocr"):
-            if not isinstance(capabilities.get(key_name), bool):
-                _append_issue(
-                    issues,
-                    _issue(
-                        "distribution_manifest_field_invalid",
-                        "distribution_manifest",
-                        "capabilities.%s must be boolean" % key_name,
-                        field="capabilities.%s" % key_name,
-                    ),
-                )
-        if not isinstance(capabilities.get("kards_det"), str) or not capabilities.get("kards_det"):
+        if not isinstance(capabilities.get("bundle_ready"), bool):
             _append_issue(
                 issues,
                 _issue(
                     "distribution_manifest_field_invalid",
                     "distribution_manifest",
-                    "capabilities.kards_det must be a non-empty string",
-                    field="capabilities.kards_det",
+                    "capabilities.bundle_ready must be boolean",
+                    field="capabilities.bundle_ready",
                 ),
             )
+        for key_name in MODEL_IDS:
+            if not isinstance(capabilities.get(key_name), str) or not capabilities.get(key_name):
+                _append_issue(
+                    issues,
+                    _issue(
+                        "distribution_manifest_field_invalid",
+                        "distribution_manifest",
+                        "capabilities.%s must be a non-empty string" % key_name,
+                        field="capabilities.%s" % key_name,
+                    ),
+                )
 
     manifest_warnings = data.get("warnings")
     if manifest_warnings is not None and (
@@ -1480,13 +1482,13 @@ def _check_distribution_files(
             )
             continue
         if not exists:
-            if entry.path == DEFAULT_MODEL_RELATIVE:
+            if entry.path in set(MODEL_IDS.values()):
                 _append_issue(
                     warnings,
                     _issue(
                         "model_missing",
-                        "model:%s" % MODEL_ID,
-                        "declared optional kards_det model is missing: %s" % entry.path,
+                        "model:%s" % entry.path,
+                        "declared optional model is missing: %s" % entry.path,
                         severity="warning",
                         affects_readiness=True,
                     ),
@@ -1609,12 +1611,6 @@ def _check_distribution(
             "state": "missing",
             "errors": [],
         },
-        "ocr_runtime": {
-            "path": str(layout.ocr_runtime_path),
-            "present": False,
-            "state": "missing",
-            "errors": [],
-        },
         "vendor_root": {
             "path": str(layout.vendor_root),
             "present": False,
@@ -1695,37 +1691,6 @@ def _check_distribution(
         )
         assets_info["relative_path"] = assets_relative
     distribution["assets_manifest"] = assets_info
-
-    ocr_relative, ocr_path, ocr_error = _first_existing_candidate(
-        layout.bundle_root,
-        OCR_RUNTIME_CANDIDATES,
-        field="ocr.runtime_path",
-    )
-    if ocr_path is None:
-        issue = _issue(
-            "ocr_runtime_unsafe_path",
-            "ocr_runtime",
-            "no safe OCR runtime candidate: %s" % (ocr_error or "unknown"),
-        )
-        ocr_info = {
-            "path": str(layout.bundle_root / ocr_relative),
-            "relative_path": ocr_relative,
-            "present": False,
-            "state": "invalid",
-            "schema": None,
-            "errors": [issue],
-        }
-        _append_issue(blockers, issue)
-    else:
-        _, ocr_info = _read_distribution_json(
-            ocr_path,
-            max_bytes=MAX_MARKER_BYTES,
-            code_prefix="ocr_runtime",
-            resource="ocr_runtime",
-            blockers=blockers,
-        )
-        ocr_info["relative_path"] = ocr_relative
-    distribution["ocr_runtime"] = ocr_info
 
     notices_path: Path | None = None
     notices_state = "missing"
@@ -2424,19 +2389,20 @@ def _relative_display(root: Path, path: Path) -> str:
 
 
 def _model_declaration(
+    model_id: str,
     worker_runtime: dict[str, Any] | None,
     distribution: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     if worker_runtime is not None and isinstance(worker_runtime.get("models"), list):
         for item in worker_runtime["models"]:
-            if isinstance(item, dict) and item.get("id") == MODEL_ID:
+            if isinstance(item, dict) and item.get("id") == model_id:
                 return item, WORKER_RUNTIME_FILENAME
     if distribution is not None:
-        optional = distribution.get("optional", {}).get(MODEL_ID)
+        optional = distribution.get("optional", {}).get(model_id)
         if isinstance(optional, dict) and optional.get("present") is True:
             return (
                 {
-                    "id": MODEL_ID,
+                    "id": model_id,
                     "path": optional.get("path"),
                     "required": False,
                     "sha256": optional.get("sha256"),
@@ -2448,6 +2414,7 @@ def _model_declaration(
 
 
 def _check_model(
+    model_id: str,
     layout: BundleLayout,
     worker_runtime: dict[str, Any] | None,
     distribution: dict[str, Any] | None,
@@ -2455,19 +2422,20 @@ def _check_model(
     blockers: list[dict[str, Any]],
     warnings: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    declaration, source = _model_declaration(worker_runtime, distribution)
+    declaration, source = _model_declaration(model_id, worker_runtime, distribution)
+    default_path = layout.model_paths[model_id]
 
     if declaration is not None:
         try:
             model_path = resolve_member_path(
                 layout.bundle_root,
                 declaration["path"],
-                field="models.%s.path" % MODEL_ID,
+                field="models.%s.path" % model_id,
             )
         except (BundlePathError, KeyError, TypeError):
-            model_path = layout.model_path
+            model_path = default_path
     else:
-        model_path = layout.model_path
+        model_path = default_path
 
     declared = declaration is not None
     required = bool(declaration.get("required")) if declaration is not None else False
@@ -2475,7 +2443,7 @@ def _check_model(
     expected_size = declaration.get("size_bytes") if declaration is not None else None
 
     info: dict[str, Any] = {
-        "id": MODEL_ID,
+        "id": model_id,
         "relative_path": _relative_display(layout.bundle_root, model_path),
         "path": str(model_path),
         "declared": declared,
@@ -2498,21 +2466,21 @@ def _check_model(
         info["reason"] = "%s: %s" % (type(exc).__name__, exc)
         _append_issue(
             blockers,
-            _issue("model_unreadable", "model:%s" % MODEL_ID, "model stat failed: %s" % exc),
+            _issue("model_unreadable", "model:%s" % model_id, "model stat failed: %s" % exc),
         )
         return info
 
     info["exists"] = bool(exists)
     if not exists:
-        message = "kards_det model is missing: %s" % model_path
+        message = "%s model is missing: %s" % (model_id, model_path)
         if required:
-            _append_issue(blockers, _issue("model_missing", "model:%s" % MODEL_ID, message))
+            _append_issue(blockers, _issue("model_missing", "model:%s" % model_id, message))
         else:
             _append_issue(
                 warnings,
                 _issue(
                     "model_missing",
-                    "model:%s" % MODEL_ID,
+                    "model:%s" % model_id,
                     message,
                     severity="warning",
                     affects_readiness=True,
@@ -2527,7 +2495,7 @@ def _check_model(
         info["reason"] = "%s: %s" % (type(exc).__name__, exc)
         _append_issue(
             blockers,
-            _issue("model_unreadable", "model:%s" % MODEL_ID, "model stat failed: %s" % exc),
+            _issue("model_unreadable", "model:%s" % model_id, "model stat failed: %s" % exc),
         )
         return info
     info["size_bytes"] = int(size)
@@ -2539,8 +2507,8 @@ def _check_model(
             warnings,
             _issue(
                 "model_unverified",
-                "model:%s" % MODEL_ID,
-                "kards_det exists but no manifest checksum declares it; never reported ready",
+                "model:%s" % model_id,
+                "%s exists but no manifest checksum declares it; never reported ready" % model_id,
                 severity="warning",
                 affects_readiness=True,
             ),
@@ -2552,7 +2520,7 @@ def _check_model(
         info["reason"] = "empty_file"
         _append_issue(
             blockers,
-            _issue("model_invalid", "model:%s" % MODEL_ID, "declared kards_det model is empty"),
+            _issue("model_invalid", "model:%s" % model_id, "declared model %s is empty" % model_id),
         )
         return info
 
@@ -2563,8 +2531,8 @@ def _check_model(
             blockers,
             _issue(
                 "model_size_mismatch",
-                "model:%s" % MODEL_ID,
-                "kards_det size %d != manifest %d" % (size, expected_size),
+                "model:%s" % model_id,
+                "%s size %d != manifest %d" % (model_id, size, expected_size),
             ),
         )
         return info
@@ -2576,8 +2544,8 @@ def _check_model(
             warnings,
             _issue(
                 "model_unverified",
-                "model:%s" % MODEL_ID,
-                "declared kards_det has no sha256; never reported ready",
+                "model:%s" % model_id,
+                "declared %s has no sha256; never reported ready" % model_id,
                 severity="warning",
                 affects_readiness=True,
             ),
@@ -2591,7 +2559,7 @@ def _check_model(
         info["reason"] = "%s: %s" % (type(exc).__name__, exc)
         _append_issue(
             blockers,
-            _issue("model_unreadable", "model:%s" % MODEL_ID, "model checksum read failed: %s" % exc),
+            _issue("model_unreadable", "model:%s" % model_id, "model checksum read failed: %s" % exc),
         )
         return info
     info["sha256"] = actual_sha
@@ -2603,8 +2571,8 @@ def _check_model(
             blockers,
             _issue(
                 "model_checksum_mismatch",
-                "model:%s" % MODEL_ID,
-                "kards_det sha256 does not match the manifest",
+                "model:%s" % model_id,
+                "%s sha256 does not match the manifest" % model_id,
             ),
         )
         return info
@@ -2618,8 +2586,8 @@ def _check_model(
             severity_target,
             _issue(
                 "model_runtime_unavailable",
-                "model:%s" % MODEL_ID,
-                "kards_det checksum matches but onnxruntime is %s" % onnx_state,
+                "model:%s" % model_id,
+                "%s checksum matches but onnxruntime is %s" % (model_id, onnx_state),
                 severity="blocker" if required else "warning",
                 affects_readiness=True,
             ),
@@ -2675,12 +2643,6 @@ def _empty_result(bundle_root: str | None) -> dict[str, Any]:
                 "state": "unavailable",
                 "errors": [],
             },
-            "ocr_runtime": {
-                "path": None,
-                "present": False,
-                "state": "unavailable",
-                "errors": [],
-            },
             "vendor_root": {
                 "path": None,
                 "present": False,
@@ -2711,9 +2673,9 @@ def _empty_result(bundle_root: str | None) -> dict[str, Any]:
         },
         "dependencies": {},
         "model": {
-            MODEL_ID: {
-                "id": MODEL_ID,
-                "relative_path": DEFAULT_MODEL_RELATIVE,
+            model_id: {
+                "id": model_id,
+                "relative_path": relative,
                 "path": None,
                 "declared": False,
                 "declaration_source": None,
@@ -2727,6 +2689,7 @@ def _empty_result(bundle_root: str | None) -> dict[str, Any]:
                 "ready": False,
                 "reason": "bundle_root_unavailable",
             }
+            for model_id, relative in MODEL_IDS.items()
         },
         "blockers": [],
         "warnings": [],
@@ -2796,7 +2759,8 @@ def _check_layout(layout: BundleLayout) -> dict[str, Any]:
     dependencies = _check_dependencies(runtime_paths, runtime_data, blockers, warnings)
     result["dependencies"] = dependencies
     result["model"] = {
-        MODEL_ID: _check_model(
+        model_id: _check_model(
+            model_id,
             layout,
             runtime_data,
             result["distribution"],
@@ -2804,6 +2768,7 @@ def _check_layout(layout: BundleLayout) -> dict[str, Any]:
             blockers,
             warnings,
         )
+        for model_id in MODEL_IDS
     }
     return _finalize(result)
 
@@ -2811,7 +2776,7 @@ def _check_layout(layout: BundleLayout) -> dict[str, Any]:
 def _resource_for_field(field: str) -> str:
     head = (field or "bundle_root").split(".", 1)[0]
     if head.startswith("models"):
-        return "model:%s" % MODEL_ID
+        return "model:%s" % head
     if head in {"runtime", "vendor", "python"}:
         return "vendored_python"
     if head.startswith("worker_runtime"):
@@ -2820,8 +2785,6 @@ def _resource_for_field(field: str) -> str:
         return "distribution_manifest"
     if head.startswith("assets"):
         return "assets_manifest"
-    if head.startswith("ocr"):
-        return "ocr_runtime"
     if head.startswith("third_party"):
         return "third_party_notices"
     if head == "worker":

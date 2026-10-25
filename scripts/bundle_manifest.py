@@ -2,21 +2,29 @@
 """Generate and verify the kards_companion offline bundle manifest.
 
 The manifest covers only the distribution payload: worker/, vendor/, assets/,
-models/, ocr_models/, plus the root THIRD_PARTY_NOTICES file.  It is separate
+models/, plus the root THIRD_PARTY_NOTICES file.  It is separate
 from the source allowlist in sync_installations.py, which is unchanged.  This
 tool never downloads files, installs packages, starts the host, or writes an
 installation target.  It writes nothing unless --output is given explicitly.
 Python 3.11+.
 """
 
-import argparse, hashlib, json, os, re, stat, sys, tempfile, tomllib
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 SCHEMA = "neko-kards-bundle-manifest/1"
-BUNDLE_DIRS = ("worker", "vendor", "assets", "models", "ocr_models")
+BUNDLE_DIRS = ("worker", "vendor", "assets", "models")
 VENDOR_SITE_PACKAGES = "vendor/python/Lib/site-packages"
 VENDOR_SITE_PACKAGES_FOLDED = VENDOR_SITE_PACKAGES.casefold()
 VENDOR_PACKAGE_RESOURCES = frozenset({"data", "config"})
@@ -32,12 +40,15 @@ FORBIDDEN_SUFFIXES = {".pyc": "pyc", ".whl": "whl"}
 NOTICE_CANDIDATES = ("THIRD_PARTY_NOTICES.md", "THIRD_PARTY_NOTICES.txt", "THIRD_PARTY_NOTICES")
 REQUIRED = (
     ("python_worker", ("worker/entry.py", "worker/bootstrap.py")),
-    ("ocr_runtime", ("ocr_models/runtime.json", "worker/models/ocr/runtime.json")),
     ("assets_manifest", ("assets/cards/manifest.json", "assets/manifest.json")),
     ("third_party_notices", NOTICE_CANDIDATES),
 )
-JSON_REQUIRED = {"ocr_runtime", "assets_manifest"}
-KARDS_DET = "models/kards_det.onnx"
+JSON_REQUIRED = {"assets_manifest"}
+# 双 YOLO 模型为可选载荷：kards_ui_det / kards_card_cls；旧 kards_det 声明删除。
+OPTIONAL_MODELS = {
+    "kards_ui_det": "models/ui_det.onnx",
+    "kards_card_cls": "models/card_cls.onnx",
+}
 NOASSERTION = "NOASSERTION"
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 DRIVE_RE = re.compile(r"^[A-Za-z]:")
@@ -232,10 +243,12 @@ class BundleScan:
         return not self.errors and all(item.get("present") for item in self.required.values())
 
     def capabilities(self):
-        return {"ocr_bundle_ready": not self.errors and bool(self.required) and
-                all(item.get("present") for item in self.required.values()),
-                "kards_det": self.optional.get("kards_det", {}).get("state", "missing"),
-                "kards_det_blocks_ocr": False}
+        ready = not self.errors and bool(self.required) and \
+            all(item.get("present") for item in self.required.values())
+        caps = {"bundle_ready": ready}
+        for model_id in OPTIONAL_MODELS:
+            caps[model_id] = self.optional.get(model_id, {}).get("state", "missing")
+        return caps
 
     def summary(self):
         return {"ok": self.ok, "root": str(self.root), "file_count": len(self.entries),
@@ -353,16 +366,17 @@ def _required_state(root, scan):
 
 def _optional_state(scan):
     by_path = {entry.path: entry for entry in scan.entries}
-    entry = by_path.get(KARDS_DET)
-    state = {"path": KARDS_DET, "state": "present" if entry else "missing",
-             "present": bool(entry), "blocks_ocr": False}
-    if entry:
-        state.update({"size": entry.size, "sha256": entry.sha256})
-        if entry.size <= 0:
-            scan.errors.append("optional_empty:kards_det")
-    else:
-        scan.warnings.append("optional_missing:kards_det")
-    scan.optional["kards_det"] = state
+    for model_id, relative in OPTIONAL_MODELS.items():
+        entry = by_path.get(relative)
+        state = {"path": relative, "state": "present" if entry else "missing",
+                 "present": bool(entry)}
+        if entry:
+            state.update({"size": entry.size, "sha256": entry.sha256})
+            if entry.size <= 0:
+                scan.errors.append(f"optional_empty:{model_id}")
+        else:
+            scan.warnings.append(f"optional_missing:{model_id}")
+        scan.optional[model_id] = state
 
 
 def _vendor_runtime_warnings(root, warnings):
@@ -570,21 +584,22 @@ def _verify_required(root, by_path, actual, report):
 
 
 def _verify_optional(by_path, actual, report):
-    entry = by_path.get(KARDS_DET)
-    st = actual.get(KARDS_DET)
-    present = st is not None
-    state = {"path": KARDS_DET, "state": "present" if present else "missing",
-             "present": present, "blocks_ocr": False}
-    if present:
-        if st.st_size <= 0:
-            report["errors"].append("optional_empty:kards_det")
-        if entry is None:
-            report["warnings"].append("optional_unlisted:kards_det")
+    for model_id, relative in OPTIONAL_MODELS.items():
+        entry = by_path.get(relative)
+        st = actual.get(relative)
+        present = st is not None
+        state = {"path": relative, "state": "present" if present else "missing",
+                 "present": present}
+        if present:
+            if st.st_size <= 0:
+                report["errors"].append(f"optional_empty:{model_id}")
+            if entry is None:
+                report["warnings"].append(f"optional_unlisted:{model_id}")
+            else:
+                state.update({"size": entry.size, "sha256": entry.sha256})
         else:
-            state.update({"size": entry.size, "sha256": entry.sha256})
-    else:
-        report["warnings"].append("optional_missing:kards_det")
-    report["optional"]["kards_det"] = state
+            report["warnings"].append(f"optional_missing:{model_id}")
+        report["optional"][model_id] = state
 
 
 def verify_manifest(root, manifest):
@@ -593,8 +608,8 @@ def verify_manifest(root, manifest):
     report = {"schema": SCHEMA, "ok": False, "errors": [], "warnings": [],
               "file_count": 0, "total_bytes": 0, "manifest_fingerprint": None,
               "required": {}, "optional": {}, "components": {},
-              "capabilities": {"ocr_bundle_ready": False, "kards_det": "missing",
-                               "kards_det_blocks_ocr": False}}
+              "capabilities": {model_id: "missing"
+                               for model_id in OPTIONAL_MODELS}}
     try:
         data = load_manifest(manifest)
     except BundleError as exc:
@@ -614,11 +629,12 @@ def verify_manifest(root, manifest):
 
     walked = _walk_allowed(root, report["errors"])
     actual = {rel: st for rel, _, st in walked}
+    optional_paths = set(OPTIONAL_MODELS.values())
     for entry in entries:
         st = actual.get(entry.path)
         if st is None:
-            if entry.path == KARDS_DET:
-                report["warnings"].append("optional_missing:kards_det")
+            if entry.path in optional_paths:
+                report["warnings"].append(f"optional_missing:{entry.path}")
             else:
                 report["errors"].append(f"file_missing:{entry.path}")
             continue
@@ -628,8 +644,8 @@ def verify_manifest(root, manifest):
         try:
             digest = fsha(root / entry.path)
         except OSError as exc:
-            if entry.path == KARDS_DET:
-                report["warnings"].append("optional_unreadable:kards_det")
+            if entry.path in optional_paths:
+                report["warnings"].append(f"optional_unreadable:{entry.path}")
             else:
                 report["errors"].append(
                     f"file_unreadable:{entry.path}:{type(exc).__name__}")
@@ -638,8 +654,8 @@ def verify_manifest(root, manifest):
             report["errors"].append(f"sha256_mismatch:{entry.path}")
 
     for rel in sorted(set(actual) - set(by_path)):
-        if rel == KARDS_DET:
-            report["warnings"].append("optional_unlisted:kards_det")
+        if rel in optional_paths:
+            report["warnings"].append(f"optional_unlisted:{rel}")
         else:
             report["errors"].append(f"unlisted_file:{rel}")
 
@@ -675,13 +691,12 @@ def verify_manifest(root, manifest):
             report["errors"].append("manifest_file_count_mismatch")
         if integrity.get("total_bytes") != report["total_bytes"]:
             report["errors"].append("manifest_total_bytes_mismatch")
-    report["capabilities"] = {
-        "ocr_bundle_ready": not report["errors"] and
-        all(item.get("present") for item in report["required"].values())
-        if report["required"] else False,
-        "kards_det": report["optional"].get("kards_det", {}).get("state", "missing"),
-        "kards_det_blocks_ocr": False,
-    }
+    ready = (not report["errors"] and bool(report["required"])
+             and all(item.get("present") for item in report["required"].values()))
+    report["capabilities"] = {"bundle_ready": ready}
+    for model_id in OPTIONAL_MODELS:
+        report["capabilities"][model_id] = report["optional"].get(
+            model_id, {}).get("state", "missing")
     report["errors"] = list(dict.fromkeys(report["errors"]))
     report["warnings"] = list(dict.fromkeys(report["warnings"]))
     report["ok"] = not report["errors"]

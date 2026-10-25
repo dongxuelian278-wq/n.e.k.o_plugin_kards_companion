@@ -23,18 +23,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PIL import Image
-
 from kards_companion.perception.capture import CaptureResult, WindowInfo
 from kards_companion.runtime.health import CaptureHealthSnapshot
 from kards_companion.state.model import (
     E_HQ_DAMAGE,
     E_MATCH_START,
+    E_ORDER_CARD,
+    E_TURN_SWITCH,
+    E_UNIT_PLAYED,
     SCENE_MATCH,
-    SCENE_MENU,
     BoardUnit,
     MatchState,
 )
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "kards_companion_api_contract"
@@ -206,21 +207,54 @@ def plugin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
 
     instance = PLUGIN_CLASS(ctx=object())
     instance.config = FakeConfig()
-    # Not yet assigned by the production constructor; status must still be
-    # queryable before the pipeline ever starts.
-    instance.classifier = None
-    instance.hud = None
     instance._events_log = []
     instance.pushes = pushes
-    # Fake frames are an 8x8 client area; the recorder privacy gate compares
-    # that size with the real client_bbox() of the target window.
-    monkeypatch.setattr(
-        MAIN, "client_bbox", lambda _window: (0, 0, 8, 8), raising=False)
     # These contracts target orchestration, not cadence.  Back-to-back ticks
     # have no wall-clock delay, so make every task due; scheduling itself is
     # covered by test_perception_scheduler_gates_expensive_tasks below.
     instance.scheduler.due = lambda *args, **kwargs: True
+    # 同理：change 门控恒脏，让 unit/card 任务每 tick 都可推进（dHash 门控
+    # 本身由 capture/调度测试覆盖）。
+    monkeypatch.setattr(type(instance), "_change_dirty", _AlwaysDirty(),
+                        raising=False)
     return instance
+
+
+class _AlwaysDirty:
+    """数据描述符：读恒 True、写忽略，供编排测试绕过 dHash 帧差门控。"""
+
+    def __get__(self, obj, objtype=None):
+        return True
+
+    def __set__(self, obj, value):
+        pass
+
+
+# Tests that exercise the read/context channel with a fake UI detector must
+# also fake the *capability table*; production weights are absent in tests and
+# an unavailable UI model must not produce current match facts.
+FAKE_UI_CAPABILITY_MODELS: dict[str, Any] = {
+    "ui_det": {
+        "state": "loaded", "loaded": True,
+        "supported_classes": [
+            "unit_board", "card_hand", "played_card", "frontline",
+            "end_turn_button"],
+        "unsupported_classes": [
+            "hq", "end_turn_button_active", "screen_victory", "screen_defeat"],
+        "diagnostics": "",
+    },
+    "card_cls": {"state": "loaded", "loaded": True},
+    "trusted_card_count": 0,
+}
+
+
+def enable_fake_ui_capability(monkeypatch: pytest.MonkeyPatch,
+                              plugin: Any) -> None:
+    monkeypatch.setattr(
+        plugin, "_models_payload",
+        lambda: {**FAKE_UI_CAPABILITY_MODELS,
+                 "ui_det": dict(FAKE_UI_CAPABILITY_MODELS["ui_det"]),
+                 "card_cls": dict(FAKE_UI_CAPABILITY_MODELS["card_cls"])})
 
 
 # ------------------------------------------------------------- declared surface
@@ -352,8 +386,6 @@ STATUS_KEYS = {
     "in_match",
     "game_number",
     "detector_loaded",
-    "ocr_available",
-    "ocr_telemetry",
     "catalog",
     "deck",
     "recent_events",
@@ -365,7 +397,9 @@ RUNTIME_STATUS_KEYS = {
     "detectors",
     "delivery",
     "perception_settings",
-    "recording",
+    "models",
+    "recognized_cards",
+    "fps_measured",
     "timeline",
     "last_snapshot",
 }
@@ -404,7 +438,7 @@ def test_get_status_schema_before_pipeline_start(plugin: Any) -> None:
     payload = result.data
     assert STATUS_KEYS <= set(payload)
     assert RUNTIME_STATUS_KEYS <= set(payload)
-    assert payload["schema_version"] == "kards_status_v1"
+    assert payload["schema_version"] == "kards_status_v2"
     assert CAPTURE_KEYS <= set(payload["capture"])
     assert PIPELINE_KEYS <= set(payload["pipeline"])
     assert DETECTOR_KEYS <= set(payload["detectors"])
@@ -419,9 +453,13 @@ def test_get_status_schema_before_pipeline_start(plugin: Any) -> None:
     assert payload["dry_run"] is False
     assert payload["in_match"] is False
     assert payload["game_number"] == 0
-    assert payload["detector_loaded"] is False
-    assert payload["ocr_available"] is False
-    assert payload["ocr_telemetry"] == {}
+    # Model loading depends on whether onnxruntime is installed in this test
+    # environment; the schema must expose the boolean either way.
+    assert isinstance(payload["detector_loaded"], bool)
+    # OCR 全链路已移除：状态面不再出现 OCR 键。
+    assert "ocr_available" not in payload
+    assert "ocr_telemetry" not in payload
+    assert "recording" not in payload
     assert set(payload["catalog"]) == CATALOG_KEYS
     assert payload["deck"] is None
     assert payload["recent_events"] == []
@@ -437,30 +475,34 @@ def test_get_status_schema_before_pipeline_start(plugin: Any) -> None:
     assert perception["fps"] == {
         "capture_fps": 20.0,
         "change_fps": 10.0,
-        "hud_fps": 4.0,
-        "unit_fps": 8.0,
+        "unit_fps": 4.0,
+        "card_fps": 6.0,
     }
     assert perception["presets"]["low_cost"] == {
-        "capture_fps": 15.0, "change_fps": 8.0, "hud_fps": 3.0, "unit_fps": 5.0}
+        "capture_fps": 15.0, "change_fps": 8.0, "unit_fps": 2.0, "card_fps": 3.0}
     assert perception["presets"]["quality"] == {
-        "capture_fps": 30.0, "change_fps": 12.0, "hud_fps": 5.0, "unit_fps": 10.0}
+        "capture_fps": 30.0, "change_fps": 12.0, "unit_fps": 6.0, "card_fps": 10.0}
     assert perception["caps"] == {
-        "capture_fps": 30.0, "change_fps": 15.0, "hud_fps": 6.0, "unit_fps": 12.0}
-    assert perception["roi_auto_calibrate"] is True
+        "capture_fps": 30.0, "change_fps": 15.0, "unit_fps": 12.0, "card_fps": 12.0}
     assert perception["evidence_enabled"] is True
     assert "tracking_enabled" not in perception
     assert "frame_evidence_enabled" not in perception
-    assert perception["regions"]["state"] in {"unavailable", "proportional"}
-    recording = payload["recording"]
-    assert recording["enabled"] is False
-    assert recording["state"] == "off"
-    assert recording["scope"] == "match"
-    assert recording["jpeg_quality"] == 85
-    assert recording["full_resolution"] is True
-    assert recording["local_only"] is True
-    assert recording["max_bytes"] == 2 * 1024 ** 3
-    assert recording["bytes"] == 0
-    assert recording["frame_count"] == 0
+    assert "regions" not in perception
+    assert "hud_fps" not in perception
+    assert "roi_auto_calibrate" not in perception
+    assert "recording_enabled" not in perception
+    # 双模型段：权重不可用时显式 unavailable；测试环境若装了 onnxruntime
+    # 且权重存在则会真实加载，两态都必须是显式状态而不是抛错或假 ready。
+    models = payload["models"]
+    assert set(models) >= {"ui_det", "card_cls", "class_map_versions",
+                           "trusted_card_count"}
+    assert models["ui_det"]["state"] in {"unavailable", "loaded"}
+    assert models["card_cls"]["state"] in {"unavailable", "loaded"}
+    assert models["ui_det"]["nc"] == 10
+    assert models["card_cls"]["nc"] == 1083
+    assert models["trusted_card_count"] == 0
+    assert payload["recognized_cards"] == []
+    assert set(payload["fps_measured"]) == {"capture", "change", "unit", "card"}
     json.dumps(payload, ensure_ascii=False)
 
 
@@ -472,8 +514,6 @@ def test_get_status_reflects_runtime_objects(plugin: Any) -> None:
         backend="dxcam",
         stats={"frames": 4, "errors": 0},
     )
-    plugin.classifier = types.SimpleNamespace(scene="match")
-    plugin.hud = types.SimpleNamespace(telemetry={"reads": 2, "last_ms": 12.5})
     plugin._last_scene = "match"
     plugin._cfg = {**MAIN._CONFIG_DEFAULTS, "mode": "coach", "dry_run": True}
 
@@ -487,7 +527,6 @@ def test_get_status_reflects_runtime_objects(plugin: Any) -> None:
     assert payload["scene"] == "match"
     assert payload["mode"] == "coach"
     assert payload["dry_run"] is True
-    assert payload["ocr_telemetry"] == {"reads": 2, "last_ms": 12.5}
     json.dumps(payload, ensure_ascii=False)
 
 
@@ -544,7 +583,7 @@ def test_perception_settings_set_rejects_unknown_and_out_of_range(plugin: Any) -
 
     for key, cap in (
         ("capture_fps", 30), ("change_fps", 15),
-        ("hud_fps", 6), ("unit_fps", 12),
+        ("unit_fps", 12), ("card_fps", 12),
     ):
         result = asyncio.run(plugin.perception_settings_set(**{key: cap + 1}))
         assert result.ok is False, key
@@ -553,18 +592,20 @@ def test_perception_settings_set_rejects_unknown_and_out_of_range(plugin: Any) -
     bad_preset = asyncio.run(plugin.perception_settings_set(
         perception_preset="ultra"))
     assert bad_preset.ok is False
-    bad_roi = asyncio.run(plugin.perception_settings_set(
-        roi_auto_calibrate="yes"))
-    assert bad_roi.ok is False
-    # Strict A surface: no legacy alias or hidden toggle is accepted.
+    # Strict A surface: no legacy alias or hidden toggle is accepted; removed
+    # HUD/ROI/recording keys are rejected outright.
     for key, value in (
         ("preset", "quality"),
         ("detect_fps", 9),
         ("ocr_fps", 4),
         ("tracker_fps", 8),
+        ("hud_fps", 4),
+        ("roi_auto_calibrate", False),
         ("auto_calibrate", True),
         ("tracking_enabled", False),
         ("frame_evidence_enabled", False),
+        ("recording_enabled", True),
+        ("recording_max_mb", 512),
         ("recording_max_bytes", 512 * 1024 * 1024),
         ("recording_jpeg_quality", 90),
         ("recording_scope", "all"),
@@ -581,10 +622,10 @@ def test_perception_settings_set_applies_presets_and_custom_values(plugin: Any) 
     assert plugin._cfg["perception_preset"] == "quality"
     assert plugin._cfg["capture_fps"] == 30
     assert plugin._cfg["change_fps"] == 12
-    assert plugin._cfg["hud_fps"] == 5
-    assert plugin._cfg["unit_fps"] == 10
+    assert plugin._cfg["unit_fps"] == 6
+    assert plugin._cfg["card_fps"] == 10
     assert accepted.data["perception_settings"]["fps"] == {
-        "capture_fps": 30.0, "change_fps": 12.0, "hud_fps": 5.0, "unit_fps": 10.0,
+        "capture_fps": 30.0, "change_fps": 12.0, "unit_fps": 6.0, "card_fps": 10.0,
     }
     assert plugin.config.updates[-1]["kards"]["perception_preset"] == "quality"
 
@@ -595,65 +636,52 @@ def test_perception_settings_set_applies_presets_and_custom_values(plugin: Any) 
     assert plugin._cfg["capture_fps"] == 12
     assert plugin._cfg["change_fps"] == 9
     # Unspecified fields follow the explicitly requested preset baseline.
-    assert plugin._cfg["hud_fps"] == 4
-    assert plugin._cfg["unit_fps"] == 8
+    assert plugin._cfg["unit_fps"] == 4
+    assert plugin._cfg["card_fps"] == 6
 
     low = asyncio.run(plugin.perception_settings_set(
         perception_preset="low_cost"))
     assert low.ok is True
     assert [
         plugin._cfg[key] for key in MAIN.PERCEPTION_FPS_KEYS
-    ] == [15, 8, 3, 5]
+    ] == [15, 8, 2, 3]
 
 
-def test_perception_settings_set_recording_and_roi_are_whitelisted(
-        plugin: Any) -> None:
-    result = asyncio.run(plugin.perception_settings_set(
-        roi_auto_calibrate=False,
-        recording_enabled=True,
-        recording_max_mb=512,
-    ))
-    assert result.ok is True
-    assert plugin._cfg["roi_auto_calibrate"] is False
-    assert plugin._cfg["recording_enabled"] is True
-    assert plugin._cfg["recording_max_mb"] == 512
-    payload = asyncio.run(plugin.monitor_status()).data
-    assert payload["perception_settings"]["roi_auto_calibrate"] is False
-    assert payload["perception_settings"]["evidence_enabled"] is True
-    assert "tracking_enabled" not in payload["perception_settings"]
-    assert payload["recording"]["enabled"] is True
-    assert payload["recording"]["max_bytes"] == 512 * 1024 ** 2
-    assert payload["recording"]["local_only"] is True
-    assert payload["recording"]["scope"] == "match"
-    # Enabled but outside a match: the UI must never claim that a file is
-    # being written.
-    assert payload["recording"]["state"] in {
-        "idle", "closed", "paused", "unavailable"}
-
-
-def test_perception_settings_recording_limits_are_fixed(plugin: Any) -> None:
-    assert plugin._cfg["recording_max_mb"] == 2048
-    for patch in (
-        {"recording_max_mb": 63},
-        {"recording_max_mb": 65537},
-        {"recording_max_bytes": 64 * 1024 ** 2 - 1},
-        {"recording_max_bytes": 64 * 1024 ** 3 + 1},
-        {"recording_max_mb": 512, "recording_max_bytes": 1024 * 1024},
-        {"recording_jpeg_quality": 69},
-        {"recording_jpeg_quality": 96},
-        {"recording_scope": "all"},
+def test_perception_settings_removed_keys_are_rejected(plugin: Any) -> None:
+    # ROI 校准与录像键已删除：动作白名单不再接受它们。
+    for key, value in (
+        ("roi_auto_calibrate", False),
+        ("recording_enabled", True),
+        ("recording_max_mb", 512),
     ):
-        result = asyncio.run(plugin.perception_settings_set(**patch))
-        assert result.ok is False, patch
+        result = asyncio.run(plugin.perception_settings_set(**{key: value}))
+        assert result.ok is False, key
         assert plugin.config.updates == []
-    assert plugin._cfg["recording_max_mb"] == 2048
-    assert plugin._cfg["recording_jpeg_quality"] == 85
+    payload = asyncio.run(plugin.monitor_status()).data
+    assert "recording" not in payload
+    assert "recording_enabled" not in payload["perception_settings"]
+    assert "roi_auto_calibrate" not in payload["perception_settings"]
 
-    accepted = asyncio.run(plugin.perception_settings_set(
-        recording_max_mb=65536))
-    assert accepted.ok is True
-    assert plugin._cfg["recording_max_mb"] == 65536
-    assert plugin._cfg["recording_jpeg_quality"] == 85
+
+def test_legacy_config_keys_are_ignored_with_warning(plugin: Any) -> None:
+    # config.dump 路径（而非动作白名单）里出现的旧键：忽略并记 warning。
+    def legacy_warnings() -> int:
+        return sum(1 for record in plugin.logger.records
+                   if "legacy_key_ignored" in str(record[1])
+                   or any("legacy_key_ignored" in str(arg) for arg in record[2]))
+
+    before = legacy_warnings()
+    plugin._apply_config({"kards": {
+        "tick_ms": 333,
+        "hud_fps": 4,
+        "recording_enabled": True,
+        "recording_max_mb": 2048,
+        "roi_auto_calibrate": False,
+    }})
+    assert legacy_warnings() > before
+    assert plugin._cfg["perception_preset"] == "balanced"
+    assert "hud_fps" not in plugin._cfg
+    assert "recording_enabled" not in plugin._cfg
 
 
 def test_deck_import_rejects_invalid_and_persists_valid(plugin: Any) -> None:
@@ -755,14 +783,31 @@ class FakeCapture:
 
 
 class FakeClassifier:
+    """ScreenClassifier 替身：忽略检测框，直接回放 (scene, my_turn)。"""
+
     def __init__(self, scene: str = MAIN.SCENE_MATCH, my_turn: bool = True) -> None:
         self.scene = scene
         self.my_turn = my_turn
         self.calls: list[Any] = []
 
-    def classify(self, image: Any) -> tuple[str, bool]:
-        self.calls.append(image)
+    def classify(self, detections: Any) -> tuple[str, bool | None]:
+        self.calls.append(detections)
         return self.scene, self.my_turn
+
+
+class FakeUiDetector:
+    """UiDetector 替身：默认只回报一个 frontline 框（无单位、场景可用）。"""
+
+    def __init__(self, detections: list[Any] | None = None) -> None:
+        if detections is None:
+            from kards_companion.perception.detector import Detection
+            detections = [Detection(5, "frontline", 0.9, 0.0, 0.0, 8.0, 1.0)]
+        self._detections = detections
+        self.calls: list[Any] = []
+
+    def detect(self, image: Any) -> list[Any]:
+        self.calls.append(image)
+        return list(self._detections)
 
 
 class FakeHud:
@@ -779,6 +824,31 @@ class FakeHud:
     def read(self, image: Any) -> dict[str, Any]:
         self.calls.append(image)
         return self._readings.pop(0) if self._readings else {}
+
+
+class FakeCardResult:
+    def __init__(self, card_id: str, name: str, conf: float) -> None:
+        self.card_id = card_id
+        self.name = name
+        self.conf = conf
+
+    @property
+    def known(self) -> bool:
+        return self.card_id != "unknown"
+
+
+class FakeCardClassifier:
+    available = True
+
+    def __init__(self, results: list[FakeCardResult] | None = None) -> None:
+        self._results = list(results or [])
+        self.calls: list[Any] = []
+
+    def classify(self, crop: Any, appearance: Any = None) -> Any:
+        self.calls.append((crop, appearance))
+        if self._results:
+            return self._results.pop(0)
+        return FakeCardResult("unknown", "", 0.3)
 
 
 def trusted_health(frame_id: int, width: int = 8, height: int = 8) -> CaptureHealthSnapshot:
@@ -799,40 +869,45 @@ def blocked_health(reason: str = "window_not_found") -> CaptureHealthSnapshot:
 def capture_result(frame_id: int, color: tuple[int, int, int]) -> CaptureResult:
     image = Image.new("RGB", (8, 8), color)
     return CaptureResult(
-        frame_id=frame_id, captured_at=1.0, width=8, height=8,
+        frame_id=frame_id, captured_at=time.time(), width=8, height=8,
         backend="dxcam", image=image, foreground=True, source="dxcam",
     )
 
 
-def test_perceive_once_pauses_recognition_without_trusted_frame(plugin: Any) -> None:
+def test_perceive_once_pauses_recognition_without_trusted_frame(
+        plugin: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
+    enable_fake_ui_capability(monkeypatch, plugin)
     classifier = FakeClassifier()
-    hud = FakeHud([{"my_hq": 20, "enemy_hq": 20, "my_credits": 3,
-                    "my_credit_cap": 3}])
-    plugin.classifier = classifier
-    plugin.hud = hud
-    plugin._detector = None
+    plugin.screen_classifier = classifier
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(1, (0, 0, 0)), None, None],
         [trusted_health(1), blocked_health(), blocked_health()],
     )
 
     plugin._perceive_once()  # trusted
-    assert len(classifier.calls) == 1 and len(hud.calls) == 1
+    assert len(classifier.calls) == 1
     assert plugin.tracker.in_match and plugin.tracker.game_number == 1
     events_after_first = len(plugin._events_log)
 
     plugin._perceive_once()  # untrusted
-    assert len(classifier.calls) == 1, "OCR must not run without a trusted frame"
-    assert len(hud.calls) == 1, "HUD OCR must not run without a trusted frame"
+    assert len(classifier.calls) == 1, "detection must not run without a trusted frame"
     assert len(plugin._events_log) == events_after_first
     assert plugin.tracker.game_number == 1
     assert plugin._previous_snapshot is not None
     assert plugin._previous_snapshot.trusted is False
     tombstones = [p for p in plugin.pushes
-                  if p.get("metadata", {}).get("context_expired") is True]
+                  if p.get("metadata", {}).get("context_expired") is True
+                  and p.get("metadata", {}).get("segment") == "core"]
     assert len(tombstones) == 1
+    # The delivery owner's expire also restores the context slot; that is a
+    # second slot transition, not a second perception pause.
+    context_restores = [p for p in plugin.pushes
+                        if p.get("metadata", {}).get("segment") == "context"
+                        and p.get("metadata", {}).get("context_action") == "restore"]
+    assert len(context_restores) <= 1
     paused = [e for e in plugin.timeline.recent(20)
               if e["stage"] == "capture" and e["outcome"] == "paused"]
     assert len(paused) == 1
@@ -840,7 +915,8 @@ def test_perceive_once_pauses_recognition_without_trusted_frame(plugin: Any) -> 
     plugin._perceive_once()  # still untrusted: expire only once
     assert len(classifier.calls) == 1
     tombstones = [p for p in plugin.pushes
-                  if p.get("metadata", {}).get("context_expired") is True]
+                  if p.get("metadata", {}).get("context_expired") is True
+                  and p.get("metadata", {}).get("segment") == "core"]
     assert len(tombstones) == 1
     paused = [e for e in plugin.timeline.recent(20)
               if e["stage"] == "capture" and e["outcome"] == "paused"]
@@ -852,10 +928,8 @@ def test_perceive_once_pauses_recognition_without_trusted_frame(plugin: Any) -> 
 def test_perceive_once_attaches_structured_frame_evidence(plugin: Any) -> None:
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
-    plugin.classifier = FakeClassifier()
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier()
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture_pause_active = True
     plugin._capture = FakeCapture(
         [capture_result(7, (0, 0, 0))], [trusted_health(7)])
@@ -882,10 +956,8 @@ def test_frame_evidence_is_metadata_only(plugin: Any) -> None:
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
     plugin._apply_config({"kards": plugin._cfg})
-    plugin.classifier = FakeClassifier()
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier()
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(9, (0, 0, 0))], [trusted_health(9)])
 
@@ -1003,107 +1075,41 @@ def frame_stub(frame_id: int) -> Any:
         window=window, trusted=True)
 
 
-def test_recording_is_local_in_match_and_closes_on_confirmed_exit(
+def test_recording_pipeline_is_fully_removed(plugin: Any) -> None:
+    # 录像链路删除契约：主类不再持有 recorder/回调/设置项。
+    for attribute in ("recorder", "_recorder_io_lock", "_recording_match_live",
+                      "_recording_in_match", "_recording_accepting",
+                      "_on_capture_frame", "_start_recording_match",
+                      "_end_recording_match", "_recording_payload"):
+        assert not hasattr(plugin, attribute), attribute
+    import inspect as _inspect
+    source = _inspect.getsource(MAIN)
+    for removed in ("TemporaryFrameRecorder", "RECORDING_JPEG_QUALITY_DEFAULT",
+                    "recording_enabled"):
+        assert removed not in source, removed
+
+
+def test_unit_pipeline_writes_units_without_region_calibration(
         plugin: Any) -> None:
-    class SceneSequence:
-        def __init__(self, scenes: list[str]) -> None:
-            self.scenes = list(scenes)
-
-        def classify(self, image: Any) -> tuple[str, bool]:
-            scene = self.scenes.pop(0)
-            return scene, scene == SCENE_MATCH
-
-    recorder = FakeRecorder()
-    plugin.recorder = recorder
-    plugin._monitoring = True
-    plugin._cfg = {
-        "tick_ms": 333,
-        "chatter_interval_seconds": 0,
-        "recording_enabled": True,
-        "recording_max_mb": 512,
-        "dry_run": True,
-        "llm_data_consent": False,
-    }
-    plugin._apply_config({"kards": plugin._cfg})
-    plugin.classifier = SceneSequence([
-        SCENE_MATCH, SCENE_MATCH, SCENE_MATCH,
-        SCENE_MENU, SCENE_MENU, SCENE_MENU,
-    ])
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}] * 3)
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
-    plugin._capture = FakeCapture(
-        [
-            capture_result(1, (1, 1, 1)),
-            capture_result(1, (1, 1, 1)),  # duplicate capture frame id
-            capture_result(2, (2, 2, 2)),
-            capture_result(3, (3, 3, 3)),
-            capture_result(4, (4, 4, 4)),
-            capture_result(5, (5, 5, 5)),
-        ],
-        [trusted_health(1), trusted_health(1), trusted_health(2),
-         trusted_health(3), trusted_health(4), trusted_health(5)],
-    )
-
-    plugin._perceive_once()
-    plugin._on_capture_frame(frame_stub(1))
-    plugin._perceive_once()  # same frame identity: must not be written twice
-    plugin._on_capture_frame(frame_stub(1))
-    plugin._perceive_once()
-    plugin._on_capture_frame(frame_stub(2))
-    assert recorder.started and recorder.started[0][0] == plugin._session_id
-    assert recorder.frames == [1, 2]
-    assert plugin._recording_payload()["state"] == "active"
-    assert plugin._recording_payload()["active"] is True
-    assert plugin._recording_payload()["bytes"] == 200
-
-    plugin._perceive_once()  # menu pause
-    plugin._perceive_once()  # menu pause
-    plugin._perceive_once()  # third menu frame confirms exit
-    assert recorder.frames == [], "confirmed exit deletes temporary frames"
-    assert recorder.ended == ["confirmed_exit"]
-    payload = plugin._recording_payload()
-    assert payload["state"] == "idle"
-    assert payload["bytes"] == 0
-    assert payload["frame_count"] == 0
-    closed = [
-        entry for entry in plugin.timeline.recent(30)
-        if entry["stage"] == "recording" and entry["outcome"] == "closed"
-    ]
-    assert closed and closed[-1]["detail"]["bytes"] == 200
-    assert closed[-1]["detail"]["frame_count"] == 2
-    # Consent is unrelated to local recording, but still blocks host pushes.
-    assert plugin.pushes == []
-
-
-def test_detector_positions_calibrate_hud_regions(plugin: Any) -> None:
-    # Use the exact class object imported by the plugin module; importing the
-    # regular package path would create a second module instance whose
-    # ``Detection`` fails the detector's isinstance guard.
+    # ROI 区域校准已随 OCR 链路移除：单位轨迹不再依赖 calibrator。
     detector_module = importlib.import_module(
         MAIN.__name__ + ".perception.detector")
     Detection = detector_module.Detection
-
     image = Image.new("RGB", (1920, 1080), (0, 0, 0))
     detections = [
-        Detection(0, "frontline", 0.9, 860, 452, 1060, 552),
-        Detection(1, "hq", 0.9, 1165, 209, 1265, 309),
-        Detection(1, "hq", 0.9, 1165, 738, 1265, 838),
-        Detection(2, "unit_board", 0.9, 1102, 598, 1202, 698),
+        Detection(5, "frontline", 0.9, 860, 452, 1060, 552),
+        Detection(0, "unit_board", 0.9, 1102, 598, 1202, 698),
     ]
 
     class FakeDetector:
         def detect(self, frame: Any) -> list[Any]:
             return detections
 
-    plugin._detector = FakeDetector()
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}])
+    plugin.ui_detector = FakeDetector()
     state = MatchState(scene=SCENE_MATCH, in_match=True)
-    plugin._apply_detector(state, image, frame_id=5, run=True)
+    plugin._apply_detector(state, image, detections, frame_id=5)
 
-    assert plugin.region_calibrator.state == "calibrated"
-    assert plugin.hud.layout is not None
-    assert plugin.hud.layout.confirmed is True
+    assert not hasattr(plugin, "region_calibrator")
     assert state.units
     unit = state.units[0]
     assert unit.bbox is not None and len(unit.bbox) == 4
@@ -1111,7 +1117,7 @@ def test_detector_positions_calibrate_hud_regions(plugin: Any) -> None:
     assert unit.first_seen_frame == 5
     payload = asyncio.run(plugin.monitor_status()).data
     assert payload["detectors"]["unit_tracker"]["frame_id"] == 5
-    assert payload["perception_settings"]["regions"]["state"] == "calibrated"
+    assert "regions" not in payload["perception_settings"]
     json.dumps(payload, ensure_ascii=False)
 
 
@@ -1132,30 +1138,34 @@ def test_perception_scheduler_gates_expensive_tasks_by_rate(
     clock = Clock()
     settings = PerceptionSettings(
         preset="custom", capture_fps=20.0, change_fps=5.0,
-        hud_fps=2.0, unit_fps=4.0)
+        unit_fps=2.0, card_fps=4.0)
     plugin.scheduler = PerceptionScheduler(settings, clock=clock)
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
-    plugin.classifier = FakeClassifier()
-    plugin.hud = FakeHud([{"my_hq": 20}, {"my_hq": 20}])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    screen = FakeClassifier()
+    plugin.screen_classifier = screen
+    detector = FakeUiDetector()
+    plugin.ui_detector = detector
     plugin._capture = FakeCapture(
-        [capture_result(i, (i, i, i)) for i in range(1, 4)],
-        [trusted_health(1), trusted_health(2), trusted_health(3)],
+        [capture_result(i, (i, i, i)) for i in range(1, 5)],
+        [trusted_health(i) for i in range(1, 5)],
     )
 
+    plugin._perceive_once()      # t=0: change + unit + card 全部到期
+    clock.t = 0.10               # 无任务到期
     plugin._perceive_once()
-    clock.t = 0.10  # change interval is 200ms: no classifier/HUD/unit
+    clock.t = 0.26               # card 到期，unit 未到（0.5s 周期）
     plugin._perceive_once()
-    clock.t = 0.21  # change due (100ms late), HUD/unit not due
+    clock.t = 0.51               # unit 再次到期
     plugin._perceive_once()
 
-    assert len(plugin.classifier.calls) == 2
-    assert len(plugin.hud.calls) == 1
-    assert plugin.scheduler.snapshot()["tasks"]["change"]["actual"] == 2
-    assert plugin.scheduler.snapshot()["tasks"]["hud"]["actual"] == 1
-    assert plugin.scheduler.snapshot()["tasks"]["unit"]["actual"] == 1
+    assert len(screen.calls) == 2, "场景推断只应随 unit 任务推进"
+    assert len(detector.calls) == 2
+    tasks = plugin.scheduler.snapshot()["tasks"]
+    assert tasks["change"]["actual"] == 3   # 0.0/0.26/0.51（change 5fps=0.2s）
+    assert tasks["unit"]["actual"] == 2     # unit 2fps=0.5s 周期
+    assert tasks["card"]["actual"] == 3     # card 4fps=0.25s：0.0/0.26/0.51
+    assert "hud" not in tasks
 
 
 def test_scheduler_runs_units_between_change_ticks_and_keeps_state(
@@ -1183,36 +1193,34 @@ def test_scheduler_runs_units_between_change_ticks_and_keeps_state(
     clock = Clock()
     settings = PerceptionSettings(
         preset="custom", capture_fps=20.0, change_fps=1.0,
-        hud_fps=4.0, unit_fps=8.0)
+        unit_fps=8.0, card_fps=4.0)
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
     plugin._apply_config({"kards": plugin._cfg})
     plugin.scheduler = PerceptionScheduler(settings, clock=clock)
-    plugin.classifier = FakeClassifier()
-    plugin.hud = FakeHud([{"my_hq": 20}, {"my_hq": 20}])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
+    screen = FakeClassifier()
+    plugin.screen_classifier = screen
     detector = CountingDetector()
-    plugin._detector = detector
+    plugin.ui_detector = detector
     plugin._capture = FakeCapture(
         [capture_result(i, (i, i, i)) for i in range(1, 4)],
         [trusted_health(i) for i in range(1, 4)],
     )
 
-    plugin._perceive_once()       # change + HUD + unit all due
-    clock.t = 0.13                # change not due, unit due, HUD not due
+    plugin._perceive_once()       # change + unit + card all due
+    clock.t = 0.13                # change/card not due, unit due
     plugin._perceive_once()
-    clock.t = 0.26                # change not due, unit + HUD due
+    clock.t = 0.26                # unit + card due, change not due
     plugin._perceive_once()
 
-    assert len(plugin.classifier.calls) == 1, "change task stays at 1 fps"
-    assert len(plugin.hud.calls) == 2
+    assert len(screen.calls) == 3, "unit task runs on its own 8 fps cadence"
     assert detector.calls == 3
-    assert plugin.scheduler.snapshot()["tasks"]["change"]["actual"] == 1
-    assert plugin.scheduler.snapshot()["tasks"]["unit"]["actual"] == 3
-    # Carried-forward state means an independent unit tick still sees a match
-    # scene and the last HUD values instead of an empty/unknown frame.
+    tasks = plugin.scheduler.snapshot()["tasks"]
+    assert tasks["change"]["actual"] == 1
+    assert tasks["unit"]["actual"] == 3
     assert plugin._pipeline_state.scene == SCENE_MATCH
-    assert plugin._pipeline_state.my_hq == 20
+    # HUD numbers are gone: my_hq stays None and is never filled with 0.
+    assert plugin._pipeline_state.my_hq is None
 
 
 def test_missing_capture_frame_id_is_generated_once_and_shared(
@@ -1220,10 +1228,8 @@ def test_missing_capture_frame_id_is_generated_once_and_shared(
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
     plugin._apply_config({"kards": plugin._cfg})
-    plugin.classifier = FakeClassifier()
-    plugin.hud = FakeHud([{"my_hq": 20}, {"my_hq": 20}])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier()
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(0, (1, 1, 1)), capture_result(0, (2, 2, 2))],
         # Health may describe a newer producer frame; those ids must not be
@@ -1237,6 +1243,13 @@ def test_missing_capture_frame_id_is_generated_once_and_shared(
         return True
 
     plugin.scheduler.due = due
+    # 单位观测以“模型不可得”的证据进入（场景推断仍由前线框驱动）。
+    original_apply = plugin._apply_detector
+
+    def apply_unavailable(state, image, detections, **kwargs):
+        return original_apply(state, image, None, **kwargs)
+
+    plugin._apply_detector = apply_unavailable
     plugin._perceive_once()
     first = plugin._previous_snapshot.frame.frame_id
     assert first > 0 and first not in {77, 78}
@@ -1261,10 +1274,8 @@ def test_non_unit_tick_carries_units_without_advancing_unit_gates(
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
     plugin._apply_config({"kards": plugin._cfg})
-    plugin.classifier = FakeClassifier()
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}] * 4)
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier()
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(i, (i, i, i)) for i in range(1, 5)],
         [trusted_health(i) for i in range(1, 5)],
@@ -1315,14 +1326,106 @@ def _unit_pipeline(plugin: Any, detector: Any, count: int) -> None:
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
     plugin._apply_config({"kards": plugin._cfg})
-    plugin.classifier = FakeClassifier()
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}] * count)
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = detector
+    plugin.screen_classifier = FakeClassifier()
+    plugin.ui_detector = detector
     plugin._capture = FakeCapture(
         [capture_result(i, (i, i, i)) for i in range(1, count + 1)],
         [trusted_health(i) for i in range(1, count + 1)],
     )
+
+
+def _detection(name: str, cls_id: int, box: tuple[float, float, float, float]) -> Any:
+    module = sys.modules[MAIN.__name__ + ".perception.detector"]
+    return module.Detection(cls_id, name, 0.9, *box)
+
+
+def test_played_zoom_is_region_observation_never_an_order(
+        plugin: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(MAIN, "CARD_CROP_MIN_SIDE", 2)
+    front = _detection("frontline", 5, (0.0, 2.0, 8.0, 3.0))
+    played = _detection("played_card", 3, (1.0, 1.0, 6.0, 6.0))
+    detector = SequencedDetector([[front], [front, played], [front, played]])
+    _unit_pipeline(plugin, detector, 3)
+    # Fake trusted whitelist for this test only; production whitelist stays 0.
+    plugin._trusted_card_count = 2
+    plugin.card_classifier = FakeCardClassifier([
+        FakeCardResult("t34_1942", "T-34 1942型", 0.91),
+        FakeCardResult("t34_1942", "T-34 1942型", 0.92),
+    ])
+
+    for _ in range(3):
+        plugin._perceive_once()
+
+    state = plugin._pipeline_state
+    assert state.last_order_card is None
+    assert E_ORDER_CARD not in [record["kind"] for record in plugin._events_log]
+
+    zoom = [item for item in plugin._recognized_cards_payload()
+            if item["region"] == "played_card"]
+    assert [item["card_id"] for item in zoom] == ["t34_1942", "t34_1942"]
+    assert all("instance_id" not in item for item in zoom)
+    observation_ids = [item["observation_id"] for item in zoom]
+    assert len(set(observation_ids)) == len(observation_ids)
+    assert all(str(item["observation_id"]).startswith("card:") for item in zoom)
+    frame_ids = [item["frame_id"] for item in zoom]
+    assert len(set(frame_ids)) == len(frame_ids)
+    assert all(int(frame) > 0 for frame in frame_ids)
+
+
+def test_zoom_never_names_new_board_units_or_borrows_card_stats(
+        plugin: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(MAIN, "CARD_CROP_MIN_SIDE", 2)
+    front = _detection("frontline", 5, (0.0, 2.0, 8.0, 3.0))
+    played = _detection("played_card", 3, (1.0, 1.0, 6.0, 6.0))
+    enemy = _detection("unit_board", 0, (2.0, 0.0, 5.0, 1.0))
+    mine = _detection("unit_board", 0, (2.0, 6.0, 5.0, 7.0))
+    detector = SequencedDetector([
+        [front],
+        [front, played],
+        [front, played, enemy, mine],
+        [front, played, enemy, mine],
+    ])
+    _unit_pipeline(plugin, detector, 4)
+    plugin.card_classifier = FakeCardClassifier([
+        FakeCardResult("t34_1942", "T-34 1942型", 0.91),
+        FakeCardResult("t34_1942", "T-34 1942型", 0.91),
+        FakeCardResult("t34_1942", "T-34 1942型", 0.91),
+    ])
+
+    for _ in range(4):
+        plugin._perceive_once()
+
+    state = plugin._pipeline_state
+    assert state.last_order_card is None
+    assert E_ORDER_CARD not in [record["kind"] for record in plugin._events_log]
+    assert {unit.side for unit in state.units} == {"mine", "enemy"}
+    for unit in state.units:
+        assert unit.card_id is None
+        assert unit.card_name is None
+        assert unit.name_confidence == 0.0
+        assert unit.attack is None
+        assert unit.health is None
+        assert unit.cost is None
+    assert not [item for item in plugin._recognized_cards_payload()
+                if item.get("region") == "board"]
+
+
+def test_unknown_turn_is_carried_as_none_and_never_switches(
+        plugin: Any) -> None:
+    plugin._monitoring = True
+    plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
+    plugin._apply_config({"kards": plugin._cfg})
+    front = _detection("frontline", 5, (0.0, 2.0, 8.0, 3.0))
+    _unit_pipeline(plugin, SequencedDetector([[front], [front], [front]]), 3)
+    plugin.screen_classifier = FakeClassifier(my_turn=None)
+
+    for _ in range(3):
+        plugin._perceive_once()
+
+    assert plugin._pipeline_state.my_turn is None
+    assert plugin._pipeline_state.to_public_dict()["my_turn"] is None
+    assert not [record for record in plugin._events_log
+                if record["kind"] == E_TURN_SWITCH]
 
 
 def test_valid_empty_detections_lose_observation_but_never_die(plugin: Any) -> None:
@@ -1385,75 +1488,8 @@ def test_model_unavailable_preserves_last_known_units_without_miss(
     assert plugin._pipeline_state.unit_observation_frame == 4
 
 
-def test_recording_callback_rejects_unknown_source_or_wrong_client_bbox(
-        plugin: Any) -> None:
-    recorder = FakeRecorder()
-    plugin.recorder = recorder
-    plugin._recording_match_live = True
-    plugin._recording_in_match = True
-    plugin._recording_accepting = True
-    recorder.active = True
-
-    plugin._on_capture_frame(types.SimpleNamespace(
-        image=object(), frame_id=1, captured_at=1.0, width=8, height=8,
-        source="", window=None, trusted=True))
-    missing_window = frame_stub(2)
-    missing_window.window = None
-    plugin._on_capture_frame(missing_window)
-    wrong_size = frame_stub(3)
-    wrong_size.width = 9
-    plugin._on_capture_frame(wrong_size)
-    foreign = frame_stub(4)
-    foreign.window = WindowInfo(
-        hwnd=7, left=0, top=0, right=8, bottom=8,
-        process_name="explorer.exe", title="Desktop")
-    plugin._on_capture_frame(foreign)
-    full_desktop = frame_stub(5)
-    full_desktop.source = "desktop"
-    plugin._on_capture_frame(full_desktop)
-    assert recorder.frames == []
-
-    plugin._on_capture_frame(frame_stub(6))
-    assert recorder.frames == [6]
-
-
-def test_recording_end_deletes_current_match_but_pause_keeps_it(
-        plugin: Any) -> None:
-    recorder = FakeRecorder()
-    plugin.recorder = recorder
-    plugin._monitoring = True
-    plugin._cfg = {"tick_ms": 333, "recording_enabled": True,
-                   "recording_max_mb": 2048}
-    plugin._apply_config({"kards": plugin._cfg})
-    plugin._start_recording_match("session-1")
-    recorder.active = True
-    plugin._on_capture_frame(frame_stub(21))
-    assert recorder.frames == [21]
-
-    asyncio.run(plugin.monitor_pause())
-    assert recorder.ended == [], "pause must retain the temporary session"
-    assert recorder.active is False
-
-    asyncio.run(plugin.monitor_resume())
-    with plugin._lifecycle_lock:
-        plugin._recording_in_match = True
-    plugin._recording_set_active(True, "in_match")
-    plugin._on_capture_frame(frame_stub(22))
-    assert recorder.frames == [21, 22]
-
-    plugin._end_recording_match("confirmed_exit")
-    assert recorder.ended == ["confirmed_exit"]
-    assert recorder.frames == [], "end_match deletes the temporary session"
-    timeline = [
-        entry for entry in plugin.timeline.recent(30)
-        if entry["stage"] == "recording"
-    ]
-    assert [entry["outcome"] for entry in timeline][:2] == ["started", "closed"]
-    assert "image" not in json.dumps(timeline, ensure_ascii=False)
-    assert all("session_token" not in json.dumps(entry) for entry in timeline)
-
-
-def test_perceive_once_respond_and_read_flow_through_dispatcher(plugin: Any) -> None:
+def test_perceive_once_respond_and_read_flow_through_dispatcher(
+        plugin: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     plugin._monitoring = True
     plugin._cfg = {
         "tick_ms": 333, "chatter_interval_seconds": 0,
@@ -1462,47 +1498,62 @@ def test_perceive_once_respond_and_read_flow_through_dispatcher(plugin: Any) -> 
         "battle_output_backpressure_seconds": 0.0,
     }
     plugin._apply_config({"kards": plugin._cfg})
+    enable_fake_ui_capability(monkeypatch, plugin)
     plugin.arbiter.update(MAIN.ArbiterConfig(
         mode="companion", min_priority=1,
         cooldown_seconds=0.0, critical_cooldown_seconds=0.0))
     from kards_companion.policy.safety import OutputSafetyConfig, OutputSafetyGuard
     plugin.dispatcher._guard = OutputSafetyGuard(OutputSafetyConfig(
         min_output_interval_seconds=0.0, critical_cooldown_seconds=0.0))
-    plugin.classifier = FakeClassifier()
-    plugin.hud = FakeHud([
-        {"my_hq": 20, "enemy_hq": 20, "my_credits": 3, "my_credit_cap": 3},
-        {"my_hq": 14, "enemy_hq": 20, "my_credits": 4, "my_credit_cap": 4},
-        {"my_hq": 14, "enemy_hq": 20, "my_credits": 4, "my_credit_cap": 4},
-    ])
-    plugin._detector = None
+    module = sys.modules[MAIN.__name__ + ".perception.detector"]
+    board = module.Detection(0, "unit_board", 0.9, 2.0, 4.0, 5.0, 7.0)
+    front = module.Detection(5, "frontline", 0.9, 0.0, 0.0, 8.0, 1.0)
+    # 首帧空棋盘（match_start 建空 baseline），随后两帧单位登场确认。
+    detector = SequencedDetector([[front], [front, board], [front, board]])
+    plugin.screen_classifier = FakeClassifier()
+    plugin.ui_detector = detector
     plugin._capture = FakeCapture(
         [capture_result(1, (0, 0, 0)), capture_result(2, (255, 255, 255)),
          capture_result(3, (20, 20, 20))],
         [trusted_health(1), trusted_health(2), trusted_health(3)],
     )
-    # Bypass the dHash HUD cache: this test pins dispatcher wiring, not OCR gating.
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
 
-    plugin._perceive_once()
-    plugin._perceive_once()
-    plugin._perceive_once()
+    plugin._perceive_once()  # match_start；单位第 1 帧（待确认）
+    plugin._perceive_once()  # 单位第 2 帧确认 -> unit_played
+    plugin._perceive_once()  # 平稳 tick
 
     assert plugin.dispatcher.stats()["submitted"] == 2
     responds = [p for p in plugin.pushes if p.get("ai_behavior") == "respond"]
-    assert [p["metadata"]["kind"] for p in responds] == [E_MATCH_START, E_HQ_DAMAGE]
+    assert [p["metadata"]["kind"] for p in responds] == [E_MATCH_START, E_UNIT_PLAYED]
     assert responds[0]["visibility"] == []
     assert responds[0]["coalesce_key"] == "kards:battle_event"
     assert responds[0]["metadata"]["battle_reply_contract"] == "short_tts_line"
     reads = [p for p in plugin.pushes if p.get("ai_behavior") == "read"]
     assert reads, "live state must be published through the dispatcher read channel"
     assert all(read["visibility"] == [] for read in reads)
-    assert plugin.dispatcher.stats()["read_submitted"] == len(reads)
+    # Context enter is a direct publisher push (one per session/token), not a
+    # dispatcher read submission.  The core live-state reads are counted.
+    core_reads = [
+        p for p in reads
+        if p.get("metadata", {}).get("kind") == "game_live_state"
+        and p.get("metadata", {}).get("segment") == "core"]
+    assert core_reads
+    assert plugin.dispatcher.stats()["read_submitted"] == len(core_reads)
     assert all(not p.get("metadata", {}).get("context_expired") for p in reads)
 
 
 def test_configured_target_is_wired_to_read_and_respond(
         plugin: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("KARDS_TARGET_LANLAN", raising=False)
+    # Manual publish helper needs a loaded UI capability for a valid situation
+    # read; production weights are absent in tests.
+    monkeypatch.setattr(plugin, "_models_payload", lambda: {
+        "ui_det": {"state": "loaded", "loaded": True,
+                   "supported_classes": ["end_turn_button"],
+                   "unsupported_classes": []},
+        "card_cls": {"state": "loaded", "loaded": True},
+        "trusted_card_count": 0,
+    })
     plugin._apply_config({"kards": {
         "target_lanlan": "lanlan",
         "reply_max_chars": 28,
@@ -1530,15 +1581,16 @@ def test_perceive_once_dry_run_writes_events_only(plugin: Any, tmp_path: Path) -
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "dry_run": True, "chatter_interval_seconds": 0}
     plugin._apply_config({"kards": plugin._cfg})
-    plugin.classifier = FakeClassifier()
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}])
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier()
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(1, (10, 20, 30))], [trusted_health(1)])
 
     plugin._perceive_once()
 
     assert plugin.pushes == []
+    assert plugin.tracker.current is not None
+    assert plugin.tracker.current.my_hq is None  # HUD 数字恒 None
     assert plugin.dispatcher.stats()["simulated"] == 1
     log_path = tmp_path / "events.jsonl"
     assert log_path.is_file()
@@ -1546,8 +1598,6 @@ def test_perceive_once_dry_run_writes_events_only(plugin: Any, tmp_path: Path) -
     assert [record["kind"] for record in records] == [E_MATCH_START]
     # Dry-run still records the delivery decision instead of silently skipping
     # the dispatcher; only the host push is short-circuited.
-    suppressed = [entry for entry in plugin.timeline.recent(20)
-                  if entry["outcome"] == "dry_run_suppressed"]
     simulated = [entry for entry in plugin.timeline.recent(20)
                   if entry["outcome"] == "simulated"]
     assert simulated or plugin.dispatcher.stats()["simulated"] >= 1
@@ -1564,11 +1614,13 @@ def test_public_status_config_is_allowlisted(plugin: Any) -> None:
     assert "SECRET" not in json.dumps(payload["config"], ensure_ascii=False)
     assert payload["config"]["target_lanlan_present"] is False
     for key in (
-        "perception_preset", "capture_fps", "change_fps", "hud_fps",
-        "unit_fps", "roi_auto_calibrate", "recording_enabled",
-        "recording_max_mb",
+        "perception_preset", "capture_fps", "change_fps",
+        "unit_fps", "card_fps",
     ):
         assert key in payload["config"]
+    for removed in ("hud_fps", "roi_auto_calibrate", "recording_enabled",
+                    "recording_max_mb"):
+        assert removed not in payload["config"]
     for hidden in ("tracking_enabled", "frame_evidence_enabled"):
         assert hidden not in payload["config"]
     assert payload["perception_settings"]["evidence_enabled"] is True

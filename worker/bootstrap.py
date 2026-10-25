@@ -18,6 +18,7 @@ SDK and never pushes messages to the host.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -31,7 +32,8 @@ _PACKAGE_PARENT = Path(__file__).resolve().parent.parent
 if str(_PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_PARENT))
 
-from worker import package_check, protocol  # noqa: E402  (after sys.path setup)
+package_check = importlib.import_module("worker.package_check")
+protocol = importlib.import_module("worker.protocol")
 
 USAGE = (
     "usage: bootstrap.py [--check | --serve] [--bundle-root ABSOLUTE_WINDOWS_PATH]\n"

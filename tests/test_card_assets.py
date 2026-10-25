@@ -17,7 +17,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
 from kards_companion.knowledge import assets
 from kards_companion.knowledge.assets import (
     ASSET_FORMAT_AVIF,

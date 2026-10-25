@@ -18,9 +18,8 @@ import json
 from typing import Any
 
 import pytest
-
 from kards_companion.delivery.arbiter import ArbiterConfig, CommentaryArbiter
-from kards_companion.delivery.publisher import push_was_submitted
+from kards_companion.delivery.publisher import build_live_state_text, push_was_submitted
 from kards_companion.policy.dispatcher import DeliveryDispatcher, DispatcherConfig
 from kards_companion.policy.safety import (
     CLOSED,
@@ -179,6 +178,13 @@ def test_trusted_snapshot_is_forwarded_in_registry_order() -> None:
         ("spy", "ok"),
         ("spy", "ok"),
     ]
+
+
+def test_live_state_keeps_unknown_turn_as_null() -> None:
+    state = MatchState(scene=SCENE_MATCH, in_match=True)
+    assert state.my_turn is None
+    payload = json.loads(build_live_state_text(state).removeprefix("KARDS:"))
+    assert payload["my_turn"] is None
 
 
 def test_one_detector_failure_does_not_block_the_others() -> None:
@@ -407,7 +413,9 @@ def test_confirmed_receipt_marks_submitted_exactly_once(
 
 
 def test_push_was_submitted_contract_for_receipt_shapes() -> None:
-    assert push_was_submitted(None) is True  # legacy host means accepted
+    # Strict receipt contract: only an explicit acceptance is True.  A legacy
+    # ``None`` receipt is unconfirmed, never "submitted".
+    assert push_was_submitted(None) is False
     assert push_was_submitted(True) is True
     assert push_was_submitted(False) is False
     assert push_was_submitted({"submitted": True}) is True

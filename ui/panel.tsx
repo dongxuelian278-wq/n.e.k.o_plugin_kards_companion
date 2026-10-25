@@ -108,6 +108,7 @@ function pickBoolean(...values: any[]): boolean | undefined {
 }
 
 function formatFrameAge(value: any): string {
+  if (value === undefined || value === null || value === "") return "";
   const ms = Number(value);
   if (!Number.isFinite(ms)) return "";
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`;
@@ -125,11 +126,13 @@ function formatClock(value: any): string {
 }
 
 function formatNumber(value: any): string {
+  if (value === undefined || value === null || value === "") return "未知";
   const number = Number(value);
   return Number.isFinite(number) ? String(Math.trunc(number)) : "未知";
 }
 
 function formatSeconds(value: any): string {
+  if (value === undefined || value === null || value === "") return "未知";
   const number = Number(value);
   if (!Number.isFinite(number)) return "未知";
   if (number <= 0) return "0 s";
@@ -138,15 +141,6 @@ function formatSeconds(value: any): string {
 
 function boolText(value: any): string {
   return value === true ? "是" : value === false ? "否" : "未知";
-}
-
-function formatBytes(value: any): string {
-  const bytes = Number(value);
-  if (!Number.isFinite(bytes) || bytes < 0) return "未知";
-  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(bytes >= 10 * 1024 ** 3 ? 0 : 1)} GB`;
-  if (bytes >= 1024 ** 2) return `${Math.round(bytes / 1024 ** 2)} MB`;
-  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${Math.round(bytes)} B`;
 }
 
 function frameIdOf(event: any): string {
@@ -259,7 +253,6 @@ const STAGE_LABELS: Record<string, string> = {
   pipeline: "流水线",
   detector: "检测器",
   dispatcher: "投递",
-  recording: "录制",
   read: "只读通道",
   chat: "聊天",
   scenario: "场景",
@@ -325,38 +318,125 @@ const UNOUTPUT_OUTCOMES = [
   "rejected",
 ];
 
+// 顺序固定为：采集 / 变化检测 / 界面识别 / 卡牌识别（capture/change/unit/card）。
 const PERCEPTION_PRESET_OPTIONS = [
-  { value: "low_cost", label: "低负载（15 / 8 / 3 / 5）" },
-  { value: "balanced", label: "平衡（20 / 10 / 4 / 8）" },
-  { value: "quality", label: "质量（30 / 12 / 5 / 10）" },
+  { value: "low_cost", label: "低负载（15 / 8 / 2 / 3）" },
+  { value: "balanced", label: "平衡（20 / 10 / 4 / 6）" },
+  { value: "quality", label: "质量（30 / 12 / 6 / 10）" },
   { value: "custom", label: "自定义" },
 ];
 
 const FPS_FIELDS = [
   { key: "capture", configKey: "capture_fps", label: "采集", fallbackMin: 1, fallbackCap: 30 },
   { key: "change", configKey: "change_fps", label: "变化检测", fallbackMin: 0.5, fallbackCap: 15 },
-  { key: "hud", configKey: "hud_fps", label: "HUD OCR", fallbackMin: 0.5, fallbackCap: 6 },
-  { key: "unit", configKey: "unit_fps", label: "单位跟踪", fallbackMin: 0.5, fallbackCap: 12 },
+  { key: "unit", configKey: "unit_fps", label: "界面识别", fallbackMin: 0.5, fallbackCap: 12 },
+  { key: "card", configKey: "card_fps", label: "卡牌识别", fallbackMin: 0.5, fallbackCap: 12 },
 ];
 
-const RECORDING_STATE_LABELS: Record<string, string> = {
-  off: "关闭",
-  idle: "等待对局",
-  active: "录制中",
-  paused: "已暂停",
-  closed: "已关闭",
-  unavailable: "不可用",
-  error: "出错",
-  unknown: "未知",
+// ---------------------------------------------------------------------------
+// 识别模型 / 当前识别 / 实测频率 —— 新增文案常量（集中放置，便于统一审定）
+// ---------------------------------------------------------------------------
+// 概览「识别模型」卡
+const MODEL_CARD_TITLE = "识别模型";
+const MODEL_UI_DET_TITLE = "界面检测";
+const MODEL_CARD_CLS_TITLE = "卡牌分类";
+const MODEL_LOADED_TEXT = "文件已加载";
+const MODEL_NOT_LOADED_TEXT = "未加载（功能停用）";
+const MODEL_UNAVAILABLE_TEXT = "不可用";
+const MODEL_UNKNOWN_TEXT = "状态未知";
+const MODEL_ROW_CLASS_COUNT = "类别数";
+const MODEL_ROW_CLASS_MAP = "类别表版本";
+const MODEL_ROW_TRUSTED_COUNT = "可信卡牌数";
+const MODEL_ROW_DIAGNOSTIC = "诊断";
+const MODEL_TRUSTED_HINT =
+  "第一版为候选版。模型加载不代表识别通过；只启用已验证类别，未通过的卡牌保持未知。";
+
+// 概览「当前识别」卡
+const RECOGNIZED_CARD_TITLE = "最近卡面观测";
+const RECOGNIZED_EMPTY_TEXT = "暂无已确认卡牌";
+const RECOGNIZED_UNKNOWN_NAME = "未识别";
+const RECOGNIZED_TABLE_COLUMNS = {
+  instance: "观测",
+  name: "卡牌",
+  region: "区域",
+  conf: "置信度",
+};
+const RECOGNIZED_HINT =
+  "这里只记录看到的卡面，不据此判断出牌，也不自动分配给棋盘单位。";
+const CARD_REGION_LABELS: Record<string, string> = {
+  card_hand: "手牌",
+  played_card: "放大牌面",
+  board: "棋盘",
+};
+const UI_CLASS_LABELS: Record<string, string> = {
+  unit_board: "棋盘单位",
+  card_hand: "手牌区域",
+  card_back: "卡背",
+  played_card: "放大牌面",
+  hq: "总部位置",
+  frontline: "前线",
+  end_turn_button: "回合按钮位置",
+  end_turn_button_active: "我方回合状态",
+  screen_victory: "胜利画面",
+  screen_defeat: "失败画面",
 };
 
-const REGION_STATE_LABELS: Record<string, string> = {
-  proportional: "比例默认（未证实）",
-  calibrated: "已校准",
-  scaled: "单锚点平移（未证实）",
-  unavailable: "不可用（已暂停 ROI）",
-  unknown: "未知",
+// 实测频率（fps_measured 与目标并列）
+const FPS_MEASURED_NONE = "—";
+const FPS_MEASURED_TARGET = "目标";
+const FPS_MEASURED_ACTUAL = "实测";
+const FPS_ROW_LABELS: Record<string, string> = {
+  capture: "采集频率",
+  change: "变化检测频率",
+  unit: "界面识别频率",
+  card: "卡牌识别频率",
 };
+
+function formatHz(value: number): string {
+  return value >= 10 ? value.toFixed(1).replace(/\.0$/, "") : value.toFixed(1);
+}
+
+// “目标 10 Hz / 实测 8.3 Hz”；无实测显示“—”，目标未知显示“未知”。
+function measuredFpsText(target: number | undefined, measured: any): string {
+  const targetText = target === undefined ? "未知" : `${formatHz(target)} Hz`;
+  const raw = Number(measured);
+  const actualText =
+    measured === null ||
+      measured === undefined ||
+      !Number.isFinite(raw) ||
+      raw <= 0
+      ? FPS_MEASURED_NONE
+      : `${formatHz(raw)} Hz`;
+  return `${FPS_MEASURED_TARGET} ${targetText} / ${FPS_MEASURED_ACTUAL} ${actualText}`;
+}
+
+function formatConfidence(value: any): string {
+  const raw = Number(value);
+  return Number.isFinite(raw) && raw > 0 ? `${(raw * 100).toFixed(0)}%` : "—";
+}
+
+function classMapVersionText(value: any): string {
+  if (value === undefined || value === null || value === "") return "未知";
+  return String(value);
+}
+
+type ModelBadge = { label: string; tone: BadgeTone; diagnostic: string };
+
+// loaded 是唯一事实来源：true 才显示已加载；false 时按 state 区分
+// 不可用 / 未加载（功能停用），诊断信息原样透出，不伪装可用。
+function modelBadge(model: Record<string, any>): ModelBadge {
+  const loaded = pickBoolean(model.loaded);
+  const state = String(model.state ?? "");
+  const diagnostic = String(model.diagnostics ?? "").trim();
+  if (loaded === undefined) {
+    return { label: MODEL_UNKNOWN_TEXT, tone: "neutral", diagnostic };
+  }
+  if (loaded) return { label: MODEL_LOADED_TEXT, tone: "success", diagnostic };
+  if (state === "unavailable") {
+    return { label: MODEL_UNAVAILABLE_TEXT, tone: "warning", diagnostic };
+  }
+  return { label: MODEL_NOT_LOADED_TEXT, tone: "warning", diagnostic };
+}
 
 // 与后端 runtime/contracts.py 的 event_identity/event_edge 保持同一口径。
 // 仅用于把 recent_events 与 dispatcher timeline 的 detail.identity 精确关联；
@@ -624,10 +704,6 @@ export default function Panel(props: PluginSurfaceProps) {
     "perceptionFpsDraft",
     null,
   );
-  const [recordingMaxDraft, setRecordingMaxDraft] = props.useLocalState<any>(
-    "recordingMaxMbDraft",
-    null,
-  );
   const [eventPage, setEventPage] = props.useLocalState<number>("eventPage", 0);
   const [lifecyclePage, setLifecyclePage] = props.useLocalState<number>(
     "lifecyclePage",
@@ -723,9 +799,6 @@ export default function Panel(props: PluginSurfaceProps) {
   const detectorLoadedValue = pickBoolean(ctx.detector_loaded);
   const detectorLoaded = detectorLoadedValue === true;
   const detectorLoadedKnown = detectorLoadedValue !== undefined;
-  const ocrValue = pickBoolean(ctx.ocr_available);
-  const ocrAvailable = ocrValue === true;
-  const ocrKnown = ocrValue !== undefined;
   const recentEvents: any[] = Array.isArray(ctx.recent_events) ? ctx.recent_events : [];
 
   const healthStatus = String(captureValue.status ?? "").trim();
@@ -779,30 +852,6 @@ export default function Panel(props: PluginSurfaceProps) {
   const perceptionCaps = asRecord(perception.caps);
   const perceptionMins = asRecord(perception.mins);
   const presetCatalog = asRecord(perception.presets);
-  const recording = asRecord(ctx.recording);
-  const recordingEnabledValue = pickBoolean(
-    recording.enabled,
-    config.recording_enabled,
-  );
-  const recordingEnabled = recordingEnabledValue === true;
-  const recordingState = String(
-    recording.state ??
-      (recordingEnabledValue === undefined
-        ? "unknown"
-        : recordingEnabled
-          ? "unknown"
-          : "off"),
-  );
-  const recordingMaxBytes = firstNumber(
-    recording.max_bytes,
-    config.recording_max_mb !== undefined
-      ? Number(config.recording_max_mb) * 1024 * 1024
-      : undefined,
-  );
-  const recordingBytes = firstNumber(recording.bytes);
-  const recordingFrames = firstNumber(recording.frame_count);
-  const recordingQuality = firstNumber(recording.jpeg_quality) ?? 85;
-  const recordingScope = String(recording.scope ?? "match");
   const settingsActionAvailable = can("perception_settings_set");
   const presetRaw =
     perception.perception_preset ?? perception.preset ?? config.perception_preset;
@@ -821,10 +870,10 @@ export default function Panel(props: PluginSurfaceProps) {
       perception.capture_fps, perceptionFps.capture_fps, config.capture_fps),
     change: fallbackFps(
       perception.change_fps, perceptionFps.change_fps, config.change_fps),
-    hud: fallbackFps(
-      perception.hud_fps, perceptionFps.hud_fps, config.hud_fps),
     unit: fallbackFps(
       perception.unit_fps, perceptionFps.unit_fps, config.unit_fps),
+    card: fallbackFps(
+      perception.card_fps, perceptionFps.card_fps, config.card_fps),
   };
   const fpsValue: Record<string, number | ""> = {};
   for (const field of FPS_FIELDS) {
@@ -847,16 +896,6 @@ export default function Panel(props: PluginSurfaceProps) {
     const value = Number(fpsValue[field.key]);
     return Number.isFinite(value) && value >= minOf(field) && value <= capOf(field);
   });
-  const recordingMaxMb = recordingMaxDraft === null
-    ? (recordingMaxBytes === undefined
-        ? ""
-        : Math.round(recordingMaxBytes / (1024 * 1024)))
-    : recordingMaxDraft;
-  const recordingMaxValid =
-    recordingMaxMb !== "" &&
-    Number.isFinite(Number(recordingMaxMb)) &&
-    Number(recordingMaxMb) >= 64 &&
-    Number(recordingMaxMb) <= 65536;
   const snapshotTrusted =
     contextValid !== false &&
     pickBoolean(
@@ -865,16 +904,67 @@ export default function Panel(props: PluginSurfaceProps) {
     ) === true;
   const trustedState = snapshotTrusted ? snapshotState : {};
   const trustedInMatch = snapshotTrusted && trustedState.in_match === true;
-  const recordingStateLabel =
-    RECORDING_STATE_LABELS[recordingState] ?? "未知";
   const unitTracker = asRecord(detectors.unit_tracker);
   const unitLast = asRecord(detectors.unit_last);
   const schedulerTasks = asRecord(asRecord(perception.scheduler).tasks);
-  const regions = asRecord(perception.regions ?? ctx.roi_calibration);
-  const regionState = String(regions.state ?? "");
-  const regionStateLabel = REGION_STATE_LABELS[regionState] ?? "未知";
-  const regionAnchors = asEntries(regions.anchors);
-  const regionScale = firstNumber(regions.scale);
+
+  // 状态面 models 段：双模型加载态 + 类别表版本 + 可信卡数（kards_status_v2）。
+  const models = asRecord(ctx.models);
+  const uiDet = asRecord(models.ui_det);
+  const cardCls = asRecord(models.card_cls);
+  const classMapVersions = asRecord(models.class_map_versions);
+  const uiDetBadge = modelBadge(uiDet);
+  const cardClsBadge = modelBadge(cardCls);
+  const trustedCardCountText = formatNumber(models.trusted_card_count);
+  const supportedUiClasses: string[] = Array.isArray(uiDet.supported_classes)
+    ? uiDet.supported_classes.map(String)
+    : [];
+  const unsupportedUiClasses: string[] = Array.isArray(uiDet.unsupported_classes)
+    ? uiDet.unsupported_classes.map(String)
+    : [];
+  const uiCapabilityKnown = Array.isArray(uiDet.supported_classes);
+  const uiClassNames = (names: string[]) => names
+    .map((name) => UI_CLASS_LABELS[name] ?? name).join("、");
+  const modelRows = (
+    title: string,
+    model: Record<string, any>,
+    badge: ModelBadge,
+    versionValue: any,
+  ): Array<[string, string]> => {
+    const rows: Array<[string, string]> = [
+      [`${title} · 加载状态`, badge.label],
+      [`${title} · ${MODEL_ROW_CLASS_COUNT}`, formatNumber(model.nc)],
+      [`${title} · ${MODEL_ROW_CLASS_MAP}`, classMapVersionText(versionValue)],
+    ];
+    if (badge.diagnostic) {
+      rows.push([`${title} · ${MODEL_ROW_DIAGNOSTIC}`, clip(badge.diagnostic, 60)]);
+    }
+    return rows;
+  };
+  const uiDetRows = modelRows(
+    MODEL_UI_DET_TITLE, uiDet, uiDetBadge, classMapVersions.ui_classes);
+  const cardClsRows = modelRows(
+    MODEL_CARD_CLS_TITLE, cardCls, cardClsBadge, classMapVersions.card_classes);
+
+  // 状态面 recognized_cards：分类确认的卡牌实例（最多保留 20 条）。
+  const recognizedCards: any[] = Array.isArray(ctx.recognized_cards)
+    ? ctx.recognized_cards
+    : [];
+
+  // 状态面 fps_measured：与目标值并列展示。
+  const fpsMeasured = asRecord(ctx.fps_measured);
+  const fpsTarget: Record<string, number | undefined> = {};
+  for (const field of FPS_FIELDS) {
+    fpsTarget[field.key] = firstNumber(
+      perception[field.configKey],
+      perceptionFps[field.configKey],
+      config[field.configKey],
+    );
+  }
+  const fpsMeasuredRows: Array<[string, string]> = FPS_FIELDS.map((field) => [
+    FPS_ROW_LABELS[field.key] ?? field.label,
+    measuredFpsText(fpsTarget[field.key], fpsMeasured[field.key]),
+  ]);
 
   const captureRows: Array<[string, string]> = [];
   if (captureValue.backend) captureRows.push(["后端", String(captureValue.backend)]);
@@ -1356,6 +1446,15 @@ export default function Panel(props: PluginSurfaceProps) {
         "等待可信帧与上下文恢复。",
       tone: "warning",
     };
+  } else if (uiCapabilityKnown && supportedUiClasses.length < Number(uiDet.nc)) {
+    detectorRow = {
+      key: "detector",
+      title: "事件识别",
+      status: "仅启用已验证类别",
+      detail: uiClassNames(supportedUiClasses) || "暂无可用类别",
+      suggestion: "卡牌、单位移动和胜负识别仍未通过验证。",
+      tone: "warning",
+    };
   } else if (detectorLast.length > 0) {
     detectorRow = {
       key: "detector",
@@ -1499,13 +1598,12 @@ export default function Panel(props: PluginSurfaceProps) {
 
   const savePerceptionSettings = async () => {
     if (!settingsActionAvailable) return;
-    if (!presetKnown || !fpsValid || !recordingMaxValid) {
-      toast.error("请先修正采样值或录制上限");
+    if (!presetKnown || !fpsValid) {
+      toast.error("请先修正采样值");
       return;
     }
     const patch: Record<string, unknown> = {
       perception_preset: presetValue,
-      recording_max_mb: Math.round(Number(recordingMaxMb)),
     };
     // Send individual rates only when the user actually edited them.  A named
     // preset alone is resolved server-side, so an unloaded context cannot turn
@@ -1513,21 +1611,15 @@ export default function Panel(props: PluginSurfaceProps) {
     if (fpsDraft !== null) {
       patch.capture_fps = Number(fpsValue.capture);
       patch.change_fps = Number(fpsValue.change);
-      patch.hud_fps = Number(fpsValue.hud);
       patch.unit_fps = Number(fpsValue.unit);
+      patch.card_fps = Number(fpsValue.card);
     }
     const outcome = await call("perception_settings_set", patch);
     if (!outcome.error) {
       setPresetDraft("");
       setFpsDraft(null);
-      setRecordingMaxDraft(null);
       toast.success("设置已保存");
     }
-  };
-
-  const updatePerception = (patch: Record<string, unknown>) => {
-    if (!settingsActionAvailable) return;
-    void call("perception_settings_set", patch);
   };
 
   const applyPresetDraft = (value: string) => {
@@ -1577,14 +1669,6 @@ export default function Panel(props: PluginSurfaceProps) {
   );
 
   const renderSettings = () => {
-    const autoCalibrate = pickBoolean(
-      perception.roi_auto_calibrate,
-      config.roi_auto_calibrate,
-    );
-    const recordingEnabledKnown = pickBoolean(
-      recording.enabled,
-      config.recording_enabled,
-    );
     const presetOptions = presetKnown
       ? PERCEPTION_PRESET_OPTIONS
       : [
@@ -1628,111 +1712,8 @@ export default function Panel(props: PluginSurfaceProps) {
               ))}
             </Grid>
             <Text dim>
-              顺序为采集 / 变化检测 / HUD OCR / 单位跟踪。修改单项会切换为自定义；
-              服务端按 30 / 15 / 6 / 12 的硬上限复核，超出会被拒绝。
-            </Text>
-          </Stack>
-        </Card>
-
-        <Card title="画面区域与校准（只读）">
-          <Stack gap={10}>
-            <Switch
-              checked={autoCalibrate === true}
-              disabled={disabled || autoCalibrate === undefined}
-              label={
-                autoCalibrate === undefined
-                  ? "客户区 ROI 自动校准（状态未知）"
-                  : "客户区 ROI 自动校准"
-              }
-              onChange={(checked: boolean) =>
-                updatePerception({ roi_auto_calibrate: checked })
-              }
-            />
-            <KeyValue
-              rows={[
-                ["校准状态", regionStateLabel],
-                [
-                  "输入尺寸",
-                  regions.width && regions.height
-                    ? `${formatNumber(regions.width)}×${formatNumber(regions.height)}`
-                    : "未知",
-                ],
-                ["可信锚点", regionAnchors.length > 0
-                  ? String(regionAnchors.length)
-                  : "无"],
-                ["缩放", regionScale === undefined ? "未知" : regionScale.toFixed(3)],
-                ["原因", regions.reason ? clip(String(regions.reason), 64) : "—"],
-              ]}
-            />
-            <Text dim>
-              锚点只来自高置信 frontline / end_turn_button / hq 检测框，不使用画面
-              dHash 伪造。无可信锚点时显示比例默认（未证实），HUD 不因此判失败。
-            </Text>
-            <Text dim>
-              单位跟踪始终由单位检测任务驱动；未加载模型或检测异常时保留上次已确认
-              位置并标记为未观测，不伪造丢失或阵亡。
-            </Text>
-            <Text dim>
-              事件证据固定记录 frame_id、尺寸与观测时间，绝不包含图片、裁剪或 OCR 原文。
-            </Text>
-          </Stack>
-        </Card>
-
-        <Card title="本地录制">
-          <Stack gap={10}>
-            <Switch
-              checked={recordingEnabledKnown === true}
-              disabled={disabled || recordingEnabledKnown === undefined}
-              label={
-                recordingEnabledKnown === undefined
-                  ? "本地录制（状态未知）"
-                  : "本地录制（仅局内）"
-              }
-              onChange={(checked: boolean) =>
-                updatePerception({ recording_enabled: checked })
-              }
-            />
-            <Field
-              label="滚动上限（MB，64..65536）"
-              help="默认 2048 MB（2GB）；最大 64GB，由录制后端滚动覆盖。"
-            >
-              <NumberInput
-                value={recordingMaxMb}
-                min={64}
-                max={65536}
-                step={64}
-                disabled={disabled}
-                onChange={(value) =>
-                  setRecordingMaxDraft(value === "" ? "" : Number(value))
-                }
-              />
-            </Field>
-            <KeyValue
-              rows={[
-                ["状态", recordingStateLabel],
-                ["范围", recordingScope === "match" ? "仅局内" : "未知"],
-                [
-                  "已写入 / 上限",
-                  `${formatBytes(recordingBytes)} / ${formatBytes(recordingMaxBytes)}`,
-                ],
-                ["帧数", formatNumber(recordingFrames)],
-                [
-                  "画质",
-                  `JPEG ${formatNumber(recordingQuality)} · 原始分辨率`,
-                ],
-              ]}
-            />
-            {recordingState === "unavailable" && (
-              <Text dim>
-                录制后端尚未提供；设置会保存，但当前不会写文件。
-              </Text>
-            )}
-            {recording.error ? (
-              <Text dim>录制原因：{clip(String(recording.error), 80)}</Text>
-            ) : null}
-            <Text dim>
-              录制只写本机，按上限滚动；开启录制不会把图像发给 LLM，也不改变数据同意。
-              暂停解说只停止写入并保留本局临时帧；停止监控或确认离场会清理本局录制。
+              顺序为采集 / 变化检测 / 界面识别 / 卡牌识别。修改单项会切换为自定义；
+              服务端按 30 / 15 / 12 / 12 的硬上限复核，超出会被拒绝。
             </Text>
           </Stack>
         </Card>
@@ -1742,12 +1723,7 @@ export default function Panel(props: PluginSurfaceProps) {
             <ButtonGroup>
               <Button
                 variant="primary"
-                disabled={
-                  disabled ||
-                  !presetKnown ||
-                  !fpsValid ||
-                  !recordingMaxValid
-                }
+                disabled={disabled || !presetKnown || !fpsValid}
                 onClick={() => {
                   void savePerceptionSettings();
                 }}
@@ -1759,14 +1735,13 @@ export default function Panel(props: PluginSurfaceProps) {
                 onClick={() => {
                   setPresetDraft("");
                   setFpsDraft(null);
-                  setRecordingMaxDraft(null);
                 }}
               >
                 恢复当前值
               </Button>
             </ButtonGroup>
             <Text dim>
-              开关即时保存；采样值与录制上限点击“保存设置”后生效。
+              采样值点击“保存设置”后生效。
               {!settingsActionAvailable
                 ? " 宿主未提供 perception_settings_set，当前仅显示只读配置。"
                 : ""}
@@ -1817,17 +1792,6 @@ export default function Panel(props: PluginSurfaceProps) {
                 </StatusBadge>
               )}
               <StatusBadge tone={dryRunBadgeTone}>{dryRunBadgeLabel}</StatusBadge>
-              <StatusBadge
-                tone={
-                  recordingState === "active"
-                    ? "success"
-                    : recordingState === "error"
-                      ? "danger"
-                      : "neutral"
-                }
-              >
-                录制：{recordingStateLabel}
-              </StatusBadge>
             </Stack>
             <Stack direction="row" gap={8}>
               <StatusBadge tone={healthTone(healthStatus)}>{healthLabel}</StatusBadge>
@@ -1839,11 +1803,6 @@ export default function Panel(props: PluginSurfaceProps) {
               {mode && (
                 <StatusBadge tone="neutral">
                   模式：{mode === "coach" ? "教练" : mode === "silent" ? "静默" : mode === "companion" ? "陪伴" : `未知（${mode}）`}
-                </StatusBadge>
-              )}
-              {ocrKnown && (
-                <StatusBadge tone={ocrAvailable ? "success" : "neutral"}>
-                  OCR：{ocrAvailable ? "可用" : "缺失"}
                 </StatusBadge>
               )}
             </Stack>
@@ -1925,7 +1884,7 @@ export default function Panel(props: PluginSurfaceProps) {
             </Stack>
             {startError && <Text dim>启动错误：{startError}</Text>}
             <Text dim>
-              暂停只停识别与推送，采集保持运行；停止监控会停止采集与本地录制。
+              暂停只停识别与推送，采集保持运行；停止监控会停止采集。
             </Text>
           </Stack>
         </Card>
@@ -1943,6 +1902,7 @@ export default function Panel(props: PluginSurfaceProps) {
               {userPaused && <StatusBadge tone="warning">解说已暂停</StatusBadge>}
             </Stack>
             {captureRows.length > 0 && <KeyValue rows={captureRows} />}
+            <KeyValue rows={fpsMeasuredRows} />
             <Divider />
             {snapshotTrusted ? (
               <KeyValue
@@ -1950,7 +1910,8 @@ export default function Panel(props: PluginSurfaceProps) {
                   ["场景", scenarioText],
                   ["对局中", trustedInMatch ? "是" : "否"],
                   ["回合", formatNumber(trustedState.turn)],
-                  ["行动方", trustedInMatch ? boolText(trustedState.my_turn) : "未知"],
+                  ["行动方", trustedInMatch && typeof trustedState.my_turn === "boolean"
+                    ? trustedState.my_turn ? "我方" : "对方" : "未知"],
                   ["我方 HQ", trustedInMatch ? formatNumber(trustedState.my_hq) : "未知"],
                   ["敌方 HQ", trustedInMatch ? formatNumber(trustedState.enemy_hq) : "未知"],
                   ["手牌", trustedInMatch ? formatNumber(trustedState.hand) : "未知"],
@@ -1970,33 +1931,65 @@ export default function Panel(props: PluginSurfaceProps) {
           </Stack>
         </Card>
 
-        <Card title="本地录制">
+        <Card title={MODEL_CARD_TITLE}>
           <Stack gap={8}>
             <Stack direction="row" gap={8}>
-              <StatusBadge
-                tone={
-                  recordingState === "active"
-                    ? "success"
-                    : recordingState === "error"
-                      ? "danger"
-                      : "neutral"
-                }
-              >
-                {recordingStateLabel}
-              </StatusBadge>
+              <StatusBadge tone="neutral">{MODEL_UI_DET_TITLE}</StatusBadge>
+              <StatusBadge tone={uiDetBadge.tone}>{uiDetBadge.label}</StatusBadge>
             </Stack>
+            <KeyValue rows={uiDetRows} />
+            <KeyValue rows={[
+              ["已启用识别", uiCapabilityKnown
+                ? uiClassNames(supportedUiClasses) || "暂无" : "未知"],
+              ["未通过验证", uiCapabilityKnown
+                ? uiClassNames(unsupportedUiClasses) || "无" : "未知"],
+            ]} />
+            <Divider />
+            <Stack direction="row" gap={8}>
+              <StatusBadge tone="neutral">{MODEL_CARD_CLS_TITLE}</StatusBadge>
+              <StatusBadge tone={cardClsBadge.tone}>{cardClsBadge.label}</StatusBadge>
+            </Stack>
+            <KeyValue rows={cardClsRows} />
             <KeyValue
-              rows={[
-                ["已写入", formatBytes(recordingBytes)],
-                ["上限", formatBytes(recordingMaxBytes)],
-                ["范围", recordingScope === "match" ? "仅局内" : "未知"],
-                ["帧数", formatNumber(recordingFrames)],
-              ]}
+              rows={[[MODEL_ROW_TRUSTED_COUNT, trustedCardCountText]]}
             />
-            <Text dim>
-              仅局内录制；JPEG {formatNumber(recordingQuality)}、原始分辨率、按上限滚动。
-              文件只在本机，不随数据同意发送给 LLM。
-            </Text>
+            {models.trusted_card_count === 0 && (
+              <Text dim>尚无卡牌通过真实画面验收，当前不会报告具体卡名。</Text>
+            )}
+            <Text dim>{MODEL_TRUSTED_HINT}</Text>
+          </Stack>
+        </Card>
+
+        <Card title={RECOGNIZED_CARD_TITLE}>
+          <Stack gap={8}>
+            {recognizedCards.length === 0 ? (
+              <Text dim>{RECOGNIZED_EMPTY_TEXT}</Text>
+            ) : (
+              <DataTable
+                columns={[
+                  { key: "instance", title: RECOGNIZED_TABLE_COLUMNS.instance, width: 64 },
+                  { key: "name", title: RECOGNIZED_TABLE_COLUMNS.name },
+                  { key: "region", title: RECOGNIZED_TABLE_COLUMNS.region, width: 96 },
+                  { key: "conf", title: RECOGNIZED_TABLE_COLUMNS.conf, width: 80 },
+                ]}
+                rows={recognizedCards
+                  .slice(-8)
+                  .reverse()
+                  .map((raw) => {
+                    const card = asRecord(raw);
+                    return {
+                      instance: String(card.observation_id ?? card.frame_id ?? "—"),
+                      name: String(card.name ?? "").trim() !== ""
+                        ? clip(String(card.name), 40)
+                        : RECOGNIZED_UNKNOWN_NAME,
+                      region: CARD_REGION_LABELS[String(card.region ?? "")] ??
+                        (String(card.region ?? "") || "—"),
+                      conf: formatConfidence(card.conf),
+                    };
+                  })}
+              />
+            )}
+            <Text dim>{RECOGNIZED_HINT}</Text>
           </Stack>
         </Card>
 
@@ -2586,36 +2579,30 @@ export default function Panel(props: PluginSurfaceProps) {
             )}
           </Card>
 
-          <Card title="perception / recording">
+          <Card title="perception / models">
             <Grid columns={2} gap={12}>
               <KeyValue
                 rows={[
                   ["采样预设", String(perception.perception_preset ?? perception.preset ?? "未知")],
-                  ["采集 FPS", formatNumber(perception.capture_fps)],
-                  ["变化检测 FPS", formatNumber(perception.change_fps)],
-                  ["HUD OCR FPS", formatNumber(perception.hud_fps)],
-                  ["单位跟踪 FPS", formatNumber(perception.unit_fps)],
-                  ["ROI 自动校准", boolText(perception.roi_auto_calibrate)],
-                  ["ROI 校准状态", regionStateLabel],
-                  ["ROI 可信锚点", String(regionAnchors.length)],
+                  ...fpsMeasuredRows,
                   ["帧证据", boolText(perception.evidence_enabled)],
                   ["调度 change", `${formatNumber(schedulerTasks.change?.actual)} / ${formatNumber(schedulerTasks.change?.missed)}`],
-                  ["调度 HUD", `${formatNumber(schedulerTasks.hud?.actual)} / ${formatNumber(schedulerTasks.hud?.missed)}`],
                   ["调度 unit", `${formatNumber(schedulerTasks.unit?.actual)} / ${formatNumber(schedulerTasks.unit?.missed)}`],
+                  ["调度 card", `${formatNumber(schedulerTasks.card?.actual)} / ${formatNumber(schedulerTasks.card?.missed)}`],
                 ]}
               />
               <KeyValue
                 rows={[
-                  ["录制开关", boolText(recordingEnabled)],
-                  ["录制状态", recordingStateLabel],
-                  ["录制范围", recordingScope === "match" ? "仅局内" : "未知"],
-                  ["已写入", formatBytes(recordingBytes)],
-                  ["滚动上限", formatBytes(recordingMaxBytes)],
-                  ["帧数", formatNumber(recordingFrames)],
-                  ["JPEG 质量", formatNumber(recordingQuality)],
-                  ["仅本机", "是"],
-                  ["清理", boolText(recording.clean)],
-                  ["错误", recording.error ? clip(String(recording.error), 60) : "—"],
+                  [`${MODEL_UI_DET_TITLE} · 加载状态`, uiDetBadge.label],
+                  [`${MODEL_UI_DET_TITLE} · ${MODEL_ROW_CLASS_COUNT}`, formatNumber(uiDet.nc)],
+                  [`${MODEL_UI_DET_TITLE} · ${MODEL_ROW_CLASS_MAP}`, classMapVersionText(classMapVersions.ui_classes)],
+                  [`${MODEL_CARD_CLS_TITLE} · 加载状态`, cardClsBadge.label],
+                  [`${MODEL_CARD_CLS_TITLE} · ${MODEL_ROW_CLASS_COUNT}`, formatNumber(cardCls.nc)],
+                  [`${MODEL_CARD_CLS_TITLE} · ${MODEL_ROW_CLASS_MAP}`, classMapVersionText(classMapVersions.card_classes)],
+                  [MODEL_ROW_TRUSTED_COUNT, trustedCardCountText],
+                  [`${MODEL_UI_DET_TITLE} · ${MODEL_ROW_DIAGNOSTIC}`, uiDetBadge.diagnostic ? clip(uiDetBadge.diagnostic, 60) : "—"],
+                  [`${MODEL_CARD_CLS_TITLE} · ${MODEL_ROW_DIAGNOSTIC}`, cardClsBadge.diagnostic ? clip(cardClsBadge.diagnostic, 60) : "—"],
+                  ["已确认卡牌数", String(recognizedCards.length)],
                   ["单位状态", String(unitLast.status ?? "未知")],
                   ["单位存活/确认", `${formatNumber(unitTracker.alive)} / ${formatNumber(unitTracker.confirmed)}`],
                   ["位置帧", formatNumber(unitTracker.frame_id)],

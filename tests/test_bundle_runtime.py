@@ -17,6 +17,7 @@ matter before any real vendored runtime exists:
 from __future__ import annotations
 
 import hashlib
+import importlib
 import io
 import json
 import os
@@ -33,7 +34,8 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
-from worker import package_check, protocol  # noqa: E402
+package_check = importlib.import_module("worker.package_check")
+protocol = importlib.import_module("worker.protocol")
 
 
 @pytest.fixture
@@ -116,7 +118,6 @@ def _write_distribution(
         if (bundle / "worker" / "bootstrap.py").is_file()
         else b"# fake worker\n",
         "assets/cards/manifest.json": b'{"assets":[]}\n',
-        "ocr_models/runtime.json": b'{"runtime":"fake"}\n',
         "THIRD_PARTY_NOTICES.md": b"final test notices\n",
     }
     for relative, data in base_files.items():
@@ -125,10 +126,11 @@ def _write_distribution(
         path.write_bytes(data)
     entries = [_entry(relative, data) for relative, data in base_files.items()]
     if model_bytes is not None:
-        model_path = bundle / "models" / "kards_det.onnx"
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        model_path.write_bytes(model_bytes)
-        entries.append(_entry("models/kards_det.onnx", model_bytes))
+        models_dir = bundle / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        for relative in package_check.MODEL_IDS.values():
+            (bundle / relative).write_bytes(model_bytes)
+            entries.append(_entry(relative, model_bytes))
     entries.sort(key=lambda item: str(item["path"]))
     by_path = {str(entry["path"]): entry for entry in entries}
     required: dict[str, dict[str, object]] = {}
@@ -142,19 +144,19 @@ def _write_distribution(
             "size": entry["size"],
             "sha256": entry["sha256"],
         }
-    optional: dict[str, dict[str, object]] = {
-        "kards_det": {
-            "path": "models/kards_det.onnx",
+    optional: dict[str, dict[str, object]] = {}
+    for model_id, relative in package_check.MODEL_IDS.items():
+        state = {
+            "path": relative,
             "state": "present" if model_bytes is not None else "missing",
             "present": model_bytes is not None,
-            "blocks_ocr": False,
         }
-    }
-    if model_bytes is not None:
-        model_entry = by_path["models/kards_det.onnx"]
-        optional["kards_det"].update(
-            {"size": model_entry["size"], "sha256": model_entry["sha256"]}
-        )
+        if model_bytes is not None:
+            model_entry = by_path[relative]
+            state.update(
+                {"size": model_entry["size"], "sha256": model_entry["sha256"]}
+            )
+        optional[model_id] = state
     integrity = {
         "file_count": len(entries),
         "total_bytes": sum(int(entry["size"]) for entry in entries),
@@ -176,9 +178,11 @@ def _write_distribution(
         "required": required,
         "optional": optional,
         "capabilities": {
-            "ocr_bundle_ready": True,
-            "kards_det": "present" if model_bytes is not None else "missing",
-            "kards_det_blocks_ocr": False,
+            "bundle_ready": True,
+            **{
+                model_id: "present" if model_bytes is not None else "missing"
+                for model_id in package_check.MODEL_IDS
+            },
         },
         "warnings": [],
         "integrity": integrity,
@@ -190,7 +194,8 @@ def _write_distribution(
 
 def _worker_runtime(
     *,
-    model_path: str = "models/kards_det.onnx",
+    model_path: str = "models/ui_det.onnx",
+    model_id: str = "kards_ui_det",
     model_bytes: bytes = b"",
     sha256: str | None = None,
     required: bool = True,
@@ -223,7 +228,7 @@ def _worker_runtime(
         ],
         "models": [
             {
-                "id": "kards_det",
+                "id": model_id,
                 "path": model_path,
                 "required": required,
                 "sha256": digest,
@@ -262,11 +267,10 @@ def test_layout_is_absolute_and_bundle_contained(fake_bundle: Path, monkeypatch:
         layout.worker_runtime_path,
         layout.distribution_manifest_path,
         layout.assets_manifest_path,
-        layout.ocr_runtime_path,
         layout.python_root,
         layout.python_exe,
         layout.site_packages,
-        layout.model_path,
+        *layout.model_paths.values(),
     ):
         assert Path(path).is_absolute()
         assert package_check.is_within_root(layout.bundle_root, path)
@@ -312,7 +316,7 @@ def test_missing_distribution_and_vendor_are_blocked_and_worker_runtime_is_optio
     codes = {item["code"] for item in result["blockers"]}
     assert "distribution_manifest_missing" in codes
     assert "assets_manifest_missing" in codes
-    assert "ocr_runtime_missing" in codes
+    assert "ocr_runtime_missing" not in codes  # OCR 标记已删除
     assert "vendor_missing" in codes
     assert "third_party_notices_missing" in codes
     assert "vendor_python_missing" in codes
@@ -323,16 +327,18 @@ def test_missing_distribution_and_vendor_are_blocked_and_worker_runtime_is_optio
     assert result["worker_runtime"]["present"] is False
     assert result["distribution"]["manifest"]["state"] == "missing"
     assert result["distribution"]["assets_manifest"]["state"] == "missing"
-    assert result["distribution"]["ocr_runtime"]["state"] == "missing"
+    assert "ocr_runtime" not in result["distribution"]
     assert result["distribution"]["vendor_root"]["present"] is False
     assert result["components"] == {}
 
     assert result["python"]["python_exe_present"] is False
     assert result["python"]["site_packages_present"] is False
     assert result["python"]["runtime_root"].endswith("vendor" + os.sep + "python")
-    assert result["model"]["kards_det"]["state"] == "missing"
-    assert result["model"]["kards_det"]["ready"] is False
-    assert result["model"]["kards_det"]["sha256"] is None
+    assert set(result["model"]) == set(package_check.MODEL_IDS)
+    for model_id in package_check.MODEL_IDS:
+        assert result["model"][model_id]["state"] == "missing"
+        assert result["model"][model_id]["ready"] is False
+        assert result["model"][model_id]["sha256"] is None
     assert result["dependencies"] == {}
 
     warning_codes = {item["code"] for item in result["warnings"]}
@@ -342,7 +348,6 @@ def test_missing_distribution_and_vendor_are_blocked_and_worker_runtime_is_optio
     for resource in (
         "distribution_manifest",
         "assets_manifest",
-        "ocr_runtime",
         "vendor",
         "third_party_notices",
         "vendored_python",
@@ -372,7 +377,7 @@ def test_distribution_manifest_components_are_reported_when_worker_runtime_is_ab
         package_check.DISTRIBUTION_MANIFEST_SCHEMA
     )
     assert result["components"] == manifest["components"]
-    assert set(result["components"]) == {"worker", "assets", "ocr_models", "notices"}
+    assert set(result["components"]) == {"worker", "assets", "notices"}
     assert result["dependencies"] == {}
     assert any(item["code"] == "worker_runtime_absent" for item in result["warnings"])
     assert "vendor_missing" in {item["code"] for item in result["blockers"]}
@@ -387,18 +392,18 @@ def test_worker_runtime_present_but_distribution_missing_stays_blocked(fake_bund
     assert result["worker_runtime"]["state"] == "loaded"
     assert "distribution_manifest_missing" in codes
     assert "assets_manifest_missing" in codes
-    assert "ocr_runtime_missing" in codes
+    assert "ocr_runtime_missing" not in codes
     assert "vendor_missing" in codes
     assert result["status"] == "blocked"
-    assert set(result["dependencies"]) == {"numpy", "PIL", "cv2", "onnxruntime", "rapidocr"}
+    assert set(result["dependencies"]) == {"numpy", "PIL", "cv2", "onnxruntime"}
 
 
 def test_present_but_undeclared_model_is_never_ready(fake_bundle: Path) -> None:
     (fake_bundle / "models").mkdir()
-    (fake_bundle / "models" / "kards_det.onnx").write_bytes(b"not-a-real-model")
+    (fake_bundle / "models" / "ui_det.onnx").write_bytes(b"not-a-real-model")
 
     result = package_check.check_bundle(fake_bundle)
-    model = result["model"]["kards_det"]
+    model = result["model"]["kards_ui_det"]
 
     assert model["exists"] is True
     assert model["declared"] is False
@@ -430,7 +435,7 @@ def test_worker_runtime_path_traversal_is_rejected(fake_bundle: Path, tmp_path: 
     assert "models[0].path" in fields
     assert "runtime.python_exe" in fields
     assert result["worker_runtime"]["state"] == "invalid"
-    assert result["model"]["kards_det"]["ready"] is False
+    assert result["model"]["kards_ui_det"]["ready"] is False
 
 
 def test_worker_runtime_rejects_python_314_and_non_windows_target(fake_bundle: Path) -> None:
@@ -455,14 +460,14 @@ def test_worker_runtime_rejects_python_314_and_non_windows_target(fake_bundle: P
 def test_declared_model_checksum_mismatch_is_not_ready(fake_bundle: Path) -> None:
     model_bytes = b"pretend-onnx-bytes"
     (fake_bundle / "models").mkdir()
-    (fake_bundle / "models" / "kards_det.onnx").write_bytes(model_bytes)
+    (fake_bundle / "models" / "ui_det.onnx").write_bytes(model_bytes)
     _write_worker_runtime(
         fake_bundle,
         _worker_runtime(model_bytes=model_bytes, sha256="0" * 64, required=True),
     )
 
     result = package_check.check_bundle(fake_bundle)
-    model = result["model"]["kards_det"]
+    model = result["model"]["kards_ui_det"]
 
     assert model["state"] == "checksum_mismatch"
     assert model["ready"] is False
@@ -472,11 +477,11 @@ def test_declared_model_checksum_mismatch_is_not_ready(fake_bundle: Path) -> Non
 def test_verified_model_without_onnxruntime_is_not_ready(fake_bundle: Path) -> None:
     model_bytes = b"pretend-onnx-bytes"
     (fake_bundle / "models").mkdir()
-    (fake_bundle / "models" / "kards_det.onnx").write_bytes(model_bytes)
+    (fake_bundle / "models" / "ui_det.onnx").write_bytes(model_bytes)
     _write_worker_runtime(fake_bundle, _worker_runtime(model_bytes=model_bytes, required=True))
 
     result = package_check.check_bundle(fake_bundle)
-    model = result["model"]["kards_det"]
+    model = result["model"]["kards_ui_det"]
 
     assert result["worker_runtime"]["state"] == "loaded"
     assert model["declared"] is True
@@ -487,19 +492,21 @@ def test_verified_model_without_onnxruntime_is_not_ready(fake_bundle: Path) -> N
     assert onnx_state != "ready"
 
 
-def test_distribution_optional_model_is_used_without_worker_runtime(fake_bundle: Path) -> None:
+def test_distribution_optional_models_are_used_without_worker_runtime(
+        fake_bundle: Path) -> None:
     model_bytes = b"pretend-onnx-bytes"
     _write_distribution(fake_bundle, model_bytes=model_bytes)
 
     result = package_check.check_bundle(fake_bundle)
-    model = result["model"]["kards_det"]
 
     assert result["worker_runtime"]["state"] == "absent"
-    assert model["declared"] is True
-    assert model["declaration_source"] == package_check.DISTRIBUTION_MANIFEST_FILENAME
-    assert model["sha256"] == hashlib.sha256(model_bytes).hexdigest()
-    assert model["state"] == "present_verified"
-    assert model["ready"] is False
+    for model_id in package_check.MODEL_IDS:
+        model = result["model"][model_id]
+        assert model["declared"] is True
+        assert model["declaration_source"] == package_check.DISTRIBUTION_MANIFEST_FILENAME
+        assert model["sha256"] == hashlib.sha256(model_bytes).hexdigest()
+        assert model["state"] == "present_verified"
+        assert model["ready"] is False
 
 
 def test_distribution_manifest_is_read_but_never_rewritten(fake_bundle: Path) -> None:
@@ -519,7 +526,7 @@ def test_distribution_manifest_is_read_but_never_rewritten(fake_bundle: Path) ->
     assert result["distribution"]["assets_manifest"]["relative_path"] == (
         "assets/cards/manifest.json"
     )
-    assert result["distribution"]["ocr_runtime"]["state"] == "loaded"
+    assert "ocr_runtime" not in result["distribution"]
     assert "distribution_manifest_missing" not in {
         item["code"] for item in result["blockers"]
     }
@@ -758,7 +765,7 @@ def test_bootstrap_check_cli_is_structured_and_read_only(fake_bundle: Path) -> N
     assert len(lines) == 1
     result = json.loads(lines[0])
     assert result["status"] == "blocked"
-    assert result["model"]["kards_det"]["ready"] is False
+    assert all(item["ready"] is False for item in result["model"].values())
     assert result["worker_runtime"]["state"] == "absent"
     assert not (fake_bundle / "vendor").exists()
     assert not (fake_bundle / "models").exists()

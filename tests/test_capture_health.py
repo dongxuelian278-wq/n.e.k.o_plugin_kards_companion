@@ -9,7 +9,6 @@ import base64
 import io
 import json
 import sys
-import threading
 import time
 import types
 from dataclasses import FrozenInstanceError
@@ -17,8 +16,6 @@ from typing import Any
 
 import numpy as np
 import pytest
-from PIL import Image
-
 from kards_companion.perception import capture as capture_mod
 from kards_companion.perception.capture import (
     ScreenCapture,
@@ -34,6 +31,7 @@ from kards_companion.runtime.health import (
     CaptureHealthSnapshot,
     evaluate_capture_health,
 )
+from PIL import Image
 
 PNG_SIZE = (1280, 720)
 
@@ -70,7 +68,9 @@ def make_capture(
         window = make_window()
     if grabber is None:
         image = Image.new("RGB", PNG_SIZE, (5, 6, 7))
-        grabber = lambda **_kwargs: image
+
+        def grabber(**_kwargs: Any) -> Any:
+            return image
     probe = occlusion_probe or (lambda _window, _bbox: occlusion)
     capture = ScreenCapture(
         window_finder=lambda: window,
@@ -376,19 +376,16 @@ def test_health_snapshot_stale_fallback_keeps_stale_reason(fake_bbox) -> None:
     assert "graphics_capture_unavailable" in health.reason
 
 
-def test_fps_update_syncs_ring_and_frame_age_budget(fake_bbox) -> None:
+def test_fps_update_syncs_frame_age_budget(fake_bbox) -> None:
     capture = make_capture(fps=8.0)
     assert capture.max_frame_age_ms == 500.0
-    assert capture.ring.fps == 8.0
 
     capture.fps = 2.0
     assert capture.fps == 2.0
-    assert capture.ring.fps == 2.0
     assert capture.max_frame_age_ms == 1500.0
 
     capture.fps = 0.01  # clamped to the supported minimum
     assert capture.fps == 0.5
-    assert capture.ring.fps == 0.5
     assert capture.max_frame_age_ms == 6000.0
 
 
@@ -671,92 +668,15 @@ def test_dxcam_missing_new_frame_falls_through_without_stale_timestamp(
     assert capture.health_snapshot().reading is True
 
 
-# ----------------------------------------------------- frame callback/ring
+# ---------------------------------------------------- producer worker（无回调）
 
-def test_on_frame_callback_runs_once_after_lock_and_survives_exception(fake_bbox) -> None:
-    captured = {"instance": None}
-    seen: list[int] = []
-
-    def callback(result: Any) -> None:
-        capture = captured["instance"]
-        assert capture is not None
-        assert capture._capture_lock.locked() is False
-        seen.append(result.frame_id)
-        if len(seen) == 1:
-            raise RuntimeError("recorder queue is full")
-
-    capture = make_capture(on_frame=callback)
-    captured["instance"] = capture
-    capture._dxcam_failed = True
-    first = capture.capture_frame()
-    second = capture.capture_frame()
-    assert first is not None and second is not None
-    assert first.frame_id == 1 and second.frame_id == 2
-    assert seen == [1, 2]
-    assert capture.stats["frames"] == 2
-    assert capture.stats["callback_errors"] == 1
-    assert capture.latest_capture() is second
-
-
-def test_on_frame_callback_never_duplicates_a_frame_id(fake_bbox) -> None:
-    seen: list[int] = []
-    capture = make_capture(on_frame=lambda result: seen.append(result.frame_id))
-    capture._dxcam_failed = True
-    result = capture.capture_frame()
-    assert result is not None
-    # The producer already delivered this id.  A second delivery attempt (for
-    # example from a stale sync caller) must be a no-op.
-    capture._notify_frame(result)
-    capture._notify_frame(result)
-    assert seen == [result.frame_id]
-
-
-def test_on_frame_callback_is_not_called_for_failed_capture() -> None:
-    seen: list[int] = []
-    capture = make_capture(
-        window=None,
-        processes=[],
-        on_frame=lambda result: seen.append(result.frame_id),
-    )
-    assert capture.capture_frame() is None
-    assert seen == []
-    assert capture.stats["callback_errors"] == 0
-
-
-def test_ring_can_be_disabled_without_jpeg_encoding(
-    monkeypatch: pytest.MonkeyPatch, fake_bbox
-) -> None:
-    calls: list[tuple[float, Any]] = []
-
-    def fake_put(_self: Any, ts: float, image: Any) -> None:
-        calls.append((ts, image))
-
-    monkeypatch.setattr(capture_mod.FrameRing, "put", fake_put)
-    disabled = make_capture(ring_enabled=False)
-    disabled._dxcam_failed = True
-    assert disabled.capture_frame() is not None
-    assert calls == []
-    assert disabled.latest_capture() is not None
-
-    enabled = make_capture(ring_enabled=True)
-    enabled._dxcam_failed = True
-    assert enabled.capture_frame() is not None
-    assert len(calls) == 1
-
-
-def test_worker_survives_callback_exception(fake_bbox) -> None:
-    seen: list[int] = []
-
-    def callback(result: Any) -> None:
-        seen.append(result.frame_id)
-        raise RuntimeError("non-blocking enqueue failed")
-
-    capture = make_capture(
-        capture_thread_enabled=True,
-        on_frame=callback,
-    )
+def test_worker_produces_frames_without_any_callback(fake_bbox) -> None:
+    # 录像帧回调链已删除：生产者不再暴露 on_frame，也不再有 JPEG 环形缓冲。
+    capture = make_capture(capture_thread_enabled=True)
     capture._dxcam_failed = True
     capture.fps = 20.0
+    assert not hasattr(capture, "ring")
+    assert not hasattr(capture, "_on_frame")
     capture.start()
     try:
         deadline = time.monotonic() + 2.0
@@ -765,40 +685,39 @@ def test_worker_survives_callback_exception(fake_bbox) -> None:
         assert capture.stats["frames"] >= 2
     finally:
         capture.stop()
-    assert capture.stats["callback_errors"] >= 2
-    assert len(seen) == len(set(seen))
+    assert "callback_errors" not in capture.stats
 
 
-def test_worker_stop_retains_latest_and_callback_ids_are_unique(fake_bbox) -> None:
-    first_frame = threading.Event()
-    seen: list[int] = []
-
-    def callback(result: Any) -> None:
-        seen.append(result.frame_id)
-        first_frame.set()
-
-    capture = make_capture(
-        capture_thread_enabled=True,
-        on_frame=callback,
-    )
+def test_worker_stop_retains_latest_capture(fake_bbox) -> None:
+    capture = make_capture(capture_thread_enabled=True)
     capture._dxcam_failed = True
     capture.fps = 20.0
     capture.start()
     try:
-        assert first_frame.wait(2.0)
-        time.sleep(0.08)
+        deadline = time.monotonic() + 2.0
+        while capture.stats["frames"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
         latest = capture.latest_capture()
         assert latest is not None
-        assert len(seen) >= 2
+        time.sleep(0.08)
     finally:
         capture.stop()
     assert capture._thread is None
     assert capture._running is False
-    # Stop must not delete the last frame; diagnostics/recorder consumers may
-    # still inspect it.
-    assert capture.latest_capture() is latest
-    assert len(seen) == len(set(seen))
-    assert seen == sorted(seen)
+    # Stop must not delete the last frame; perception consumers may still
+    # inspect it.
+    assert capture.latest_capture() is not None
+
+
+def test_frame_ids_advance_monotonically_without_callback(fake_bbox) -> None:
+    capture = make_capture()
+    capture._dxcam_failed = True
+    first = capture.capture_frame()
+    second = capture.capture_frame()
+    assert first is not None and second is not None
+    assert first.frame_id == 1 and second.frame_id == 2
+    assert capture.stats["frames"] == 2
+    assert capture.latest_capture() is second
 
 
 # -------------------------------------------------------------- host bridge

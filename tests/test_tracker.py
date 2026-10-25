@@ -208,6 +208,48 @@ def test_two_frame_turn_flip_emits_exactly_one_switch() -> None:
     assert tracker.snapshot()["turn"] == turn
 
 
+def test_true_then_unknown_never_switches_turn() -> None:
+    tracker, clock = make_tracker()
+    tracker.update(in_match(my_turn=True, my_hq=20, enemy_hq=20))
+    baseline(tracker, clock, my_turn=True)
+
+    for _ in range(3):
+        clock.t += 1.0
+        events = tracker.update(in_match(my_turn=None, my_hq=20, enemy_hq=20))
+        assert not any(event.kind == E_TURN_SWITCH for event in events)
+    assert tracker.snapshot()["turn"] == 1
+
+
+def test_carried_false_is_not_an_independent_turn_observation() -> None:
+    tracker, clock = make_tracker()
+    tracker.update(in_match(my_turn=True, my_hq=20, enemy_hq=20,
+                            unit_observation_valid=True, unit_observation_frame=1))
+    baseline(tracker, clock, my_turn=True)
+
+    # Same detector frame repeated, then carried ticks: all are one observation.
+    for _ in range(4):
+        clock.t += 1.0
+        events = tracker.update(in_match(
+            my_turn=False, my_hq=20, enemy_hq=20,
+            unit_observation_valid=False, unit_observation_frame=2))
+        assert not any(event.kind == E_TURN_SWITCH for event in events)
+
+    # Two genuinely fresh frames are required before the switch is committed.
+    clock.t += 1.0
+    assert tracker.update(in_match(
+        my_turn=False, my_hq=20, enemy_hq=20,
+        unit_observation_valid=True, unit_observation_frame=3)) == []
+    assert tracker.update(in_match(
+        my_turn=False, my_hq=20, enemy_hq=20,
+        unit_observation_valid=True, unit_observation_frame=3)) == []
+    clock.t += 1.0
+    events = tracker.update(in_match(
+        my_turn=False, my_hq=20, enemy_hq=20,
+        unit_observation_valid=True, unit_observation_frame=4))
+    assert kinds(events) == [E_TURN_SWITCH]
+    assert events[0].details["my_turn"] is False
+
+
 # --------------------------------------------------------------- HQ gates
 
 def test_hq_two_frame_confirmation_filters_spike() -> None:
@@ -627,7 +669,8 @@ def test_non_unit_tick_skips_unit_gates_but_keeps_turn_and_hq() -> None:
 
     # Non-unit ticks carry the last board but no fresh unit evidence.  They
     # must not advance miss/loss gates even with a newer capture frame id,
-    # while their turn/HQ facts still reach the diff.
+    # and carried my_turn is not an independent observation: HQ facts reach
+    # the diff, but a turn switch needs two fresh observations.
     clock.t += 1.0
     first_carried = tracker.update(in_match(
         my_hq=15, enemy_hq=20, my_turn=False, units=[],
@@ -638,7 +681,7 @@ def test_non_unit_tick_skips_unit_gates_but_keeps_turn_and_hq() -> None:
     second_carried = tracker.update(in_match(
         my_hq=15, enemy_hq=20, my_turn=False, units=[],
         unit_observation_valid=False, unit_observation_frame=7))
-    assert kinds(second_carried) == [E_TURN_SWITCH, E_HQ_DAMAGE]
+    assert kinds(second_carried) == [E_HQ_DAMAGE]
     assert tracker.unit_diagnostics()["misses"] == {}
 
     # A real empty observation is the only thing that advances the miss count.
@@ -647,6 +690,11 @@ def test_non_unit_tick_skips_unit_gates_but_keeps_turn_and_hq() -> None:
         my_hq=15, enemy_hq=20, my_turn=False, units=[],
         unit_observation_valid=True, unit_observation_frame=8))
     assert tracker.unit_diagnostics()["misses"] == {"9": 1}
+    clock.t += 1.0
+    events = tracker.update(in_match(
+        my_hq=15, enemy_hq=20, my_turn=False, units=[],
+        unit_observation_valid=True, unit_observation_frame=9))
+    assert kinds(events) == [E_TURN_SWITCH]
 
 
 def test_unit_misses_advance_only_on_fresh_observations() -> None:

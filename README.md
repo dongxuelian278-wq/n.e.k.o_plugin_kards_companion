@@ -1,16 +1,18 @@
 # KARDS 猫娘陪玩（kards_companion）
 
-KARDS 被动读屏插件。画面经采集、场景门控和单位履历转成结构化事件，再由仲裁与统一 gate 输出宿主短解说。只读屏：不读游戏内存、不抓包、不注入键鼠、不自动操作。
+KARDS 被动读屏插件。画面经采集与双 YOLO 模型（界面检测 + 卡牌分类）识别，场景门控和单位履历转成结构化事件，再由仲裁与统一 gate 输出宿主短解说。只读屏：不读游戏内存、不抓包、不注入键鼠、不自动操作。无 OCR、无录像。
 
-当前清单版本：`6.0.0`（`plugin.toml`）。宿主目标运行时：Python 3.11。
+当前清单版本：`6.1.0`（`plugin.toml`）。这是第一个提交到 N.E.K.O 市场的测试版；宿主目标运行时为 Python 3.11。read、respond 和局势查询共用 `kards_situation_v1`；与战雷的对照和限制见 [信息传递说明](docs/message-integration.md)。
 
-> 状态：本地纯逻辑/集成链有测试覆盖；真实 N.E.K.O 宿主、真实 KARDS 对局、宿主 LLM 生成、TTS 播放均未验证。离线依赖包未构建，检测模型、卡图、OCR runtime 不在本仓库。
+开发待办及对应文件位置见 [TODO](docs/TODO.md)。
+
+> 第一版只启用已验证的卡背和回合按钮位置检测。可信卡牌白名单为空，具体卡名、单位事件、回合归属和胜负识别尚未交付。两个 ONNX 可在 CPU 加载；加载成功不代表识别效果通过。完整离线依赖包未构建，正式版不晋级。修复与证据边界见 [第一版说明](docs/v1-closure.md)。
 
 ## 兼容性
 
 | 项 | 当前值 |
 | --- | --- |
-| 插件版本 | `6.0.0` |
+| 插件版本 | `6.1.0`（市场测试版） |
 | SDK `recommended` | `>=0.1.0,<0.2.0` |
 | SDK `supported` | `>=0.1.0,<0.3.0` |
 | Python | 3.11（宿主冻结运行时） |
@@ -24,14 +26,13 @@ KARDS 被动读屏插件。画面经采集、场景门控和单位履历转成�
 | --- | --- | --- |
 | 事件契约、场景解析、tracker、仲裁、gate、单槽投递 | 已实现，本地测试 | `tests/`、`docs/backend-parity.md`；未做 host 验收 |
 | Hosted UI 面板 | 静态实现 | `ui/panel.tsx`；宿主渲染未验证 |
-| N.E.K.O 宿主加载、动作路由、`push_message` 实际回执 | 未验证 | 6.0.0 无 live 证据；旧 0.1.0 安装快照不能替代 |
-| 真实 KARDS 的 HUD/场景稳定性 | 未验证 | OCR 链已接线；真实对局未验收 |
-| 单位/前线识别 | 缺模型时静默 | `models/kards_det.onnx` 不在仓库 |
+| N.E.K.O 宿主加载、动作路由、`push_message` 实际回执 | 测试版待验收 | 6.1.0 需在 dev 通道重新加载并取得新鲜回执；6.0.1 的历史结论不替代当前版本 |
+| 界面检测模型（ui_det） | 受限交付 | card_back 与 end_turn_button 逐类达标；frontline/unit_board/card_hand/played_card 未达冻结线（启发式标签噪声上限）；hq/active/victory/defeat 零样本 unsupported |
+| 卡牌分类模型（card_cls） | 候选，未验收通过 | 输出映射为 1083 类；实际训练 1023 类，60 个冲突类未启用；当前白名单 0，所有卡名均为 unknown |
 | 宿主 LLM 实际生成 | 未验证 | SDK 本地提交不等于宿主已消费或生成 |
 | TTS 实际播放 | 未验证 | 没有播放证据 |
-| 卡图资源 | `blocked_unlicensed` | 1083 条来源 URL 元数据；无图片字节 |
-| 离线依赖包 | `blocked` | `vendor/`、assets/OCR marker、manifest 均缺失 |
-| 检测模型训练 | 阻塞 | `hq=0`、raw 未人工复核、分组切分未落地，见下文 |
+| 卡图资源 | `blocked_unlicensed` | 1083 条来源 URL 元数据；图片字节不随仓库分发 |
+| 离线依赖包 | `blocked` | `vendor/`、assets marker、manifest 均缺失；本测试版不提供离线依赖包 |
 
 本 README 只记录仓库中可确认的事实。不要把上表中的未验证项写成已完成能力。
 
@@ -40,20 +41,20 @@ KARDS 被动读屏插件。画面经采集、场景门控和单位履历转成�
 | 路径 | 作用 |
 | --- | --- |
 | `__init__.py` | 插件主类、生命周期、面板动作、LLM tools、感知 tick 集成 |
-| `perception/` | 窗口发现与采集、采集健康、界面分类、HUD OCR、ROI 校准、YOLO 检测、卡面匹配、采样调度 |
-| `runtime/` | 事件契约、场景解析器、tracker 适配器、检测器注册表、快照、诊断时间线、录制器 |
+| `perception/` | 窗口发现与采集、采集健康、双 YOLO 加载与校验（models.py）、界面分类（screens.py，由检测框驱动）、单位检测与跟踪（detector.py）、采样调度（scheduling.py） |
+| `runtime/` | 事件契约、场景解析器、tracker 适配器、检测器注册表、快照、诊断时间线 |
 | `state/` | `MatchState`/`GameEvent` 等纯数据模型与 `MatchTracker` |
 | `delivery/` | 仲裁器、统一 `HostPushGate`、read/respond 发布器 |
 | `policy/` | 单槽 dispatcher、输出节奏与暂停守卫 |
 | `adapters/` | 目标角色解析与清洗 |
-| `knowledge/` | 内置卡库、卡牌目录同步、卡组代码解码、离线卡图索引 |
+| `knowledge/` | 内置卡库、卡牌目录同步、卡组代码解码、类别映射（card_classes.json / ui_classes.json）、模型清单（models_manifest.json）、可信卡白名单（trusted_cards.json） |
 | `worker/` | 离线 worker 第一阶段：bootstrap、JSON-lines 协议、bundle 自检 |
 | `scripts/` | bundle manifest、安装同步、宿主只读验收 |
 | `ui/` | `panel.tsx` Hosted UI |
-| `docs/` | 集成契约、parity、部署、离线包、录制、卡图、宿主验收 |
+| `docs/` | 集成契约、parity、部署、离线包、卡图、宿主验收、YOLO 契约 |
 | `tests/` | Python 3.11 单元/集成测试 |
-| `models/` | 可选检测模型；当前为空，`kards_det.onnx` 不随仓库分发 |
-| `assets/`、`ocr_models/`、`vendor/` | 离线包资源位置；当前不存在 |
+| `models/` | ONNX 权重（ui_det.onnx / card_cls.onnx），不进 git，随部署分发 |
+| `assets/`、`vendor/` | 离线包资源位置；当前不存在 |
 
 训练工具与数据不在本仓库内，而是同级的 `training/` 目录，详见“训练状态”。
 
@@ -63,11 +64,14 @@ KARDS 被动读屏插件。画面经采集、场景门控和单位履历转成�
 capture
   → capture health / trusted frame
   → RuntimeSnapshot
-  → scene pre-gate
-  → HUD OCR + YOLO / UnitTracker
+  → scene pre-gate（dHash 变化门控）
+  → UI YOLO 检测（ui_det）→ 场景/回合态 + UnitTracker
+  → 卡牌分类（card_cls，已验证区域裁图）→ 卡面观测（不推断出牌或单位身份）
   → MatchTracker + detector registry
   → normalize_event (runtime/contracts.py)
   → scenario.update
+  → kards_situation_v1（当前事实 / 旧观测 / 未知项 / 模型能力 / 来源时间）
+  → read 上下文 / respond 提示词 / kards_get_live_state 共用
   → CommentaryArbiter.select/decide + OutputSafetyGuard
   → DeliveryDispatcher (single pending slot)
   → HostPushGate
@@ -78,7 +82,11 @@ capture
 
 - **可信帧**：只有窗口存在、帧可用、帧龄未过期且图像非空才进入识别。无有效帧、窗口最小化、`process_not_found`、`stale_frame` 时识别与解说暂停，不推进 tracker diff，也不补造单位/HQ/回合事件。
 - **场景前置门**：场景为 `OUT_OF_BATTLE` / `OPENING` / `IN_MATCH` / `PRESSURE` / `CRITICAL` / `ENDED`。`menu`/`draft`/`unknown` 帧的 `allow_diff=false`，不喂 tracker；连续 3 帧明确 `menu`/`draft` 才确认离场，`unknown` 不会被当作离场。
-- **tracker**：HQ 连续两个有效帧读到同一新值才提交；单位首次出现需要两个不同的真实观测帧确认。单位连续 3 次缺失只记录 `unit_lost` 诊断，**绝不因漏检生成 `unit_died`**；只有可靠观测到 HP=0 且连续两帧确认才可能产生阵亡事件。
+- **tracker**：HQ 数字字段（血量/Kredits）第一版恒 `None`（不读动态数字，不填 0）；单位首次出现需要两个不同的真实观测帧确认。单位连续 3 次缺失只记录 `unit_lost` 诊断，**绝不因漏检生成 `unit_died`**。
+- **卡牌身份**：仅由 card_cls YOLO 分类产生；conf/margin 双阈值不足、原始最高分类为 conflict/缺图、裁图过小或不在可信白名单时输出 `unknown`。不让次高类别顶替存疑的第一名。放大牌面只产生带帧号的卡面观测，不产生出牌事件，不自动给任何棋盘单位命名；敌方卡背不推断隐藏手牌。
+- **能力门控**：ui_det 仅返回模型清单 `capabilities` 中已通过验证的类别。当前是 `card_back` 和 `end_turn_button`；其余八类均被拦截。按钮位置不证明行动方，`my_turn` 保持 `null`。动态血量和资源也保持 `null`。
+- **信息整合**：`runtime/situation.py` 生成同一份有界局势视图，包含来源时间、可用能力、当前/保留单位、侧别未知单位、短时卡面观察和不可读字段。`read`、事件 `respond` 和 `kards_get_live_state` 共用；不可识别的棋盘不写成空盘，动态数字未知不写成 0。卡面跨 session 或超过 2 秒后剔除；UI 观测超过 1.5 秒失效，静态画面以新帧心跳复查。
+- **上下文生命周期**：可信观测时幂等建立只读上下文，再发布实时事实；退出、暂停、失效或切角色时分别失效原 core/context 槽，并提示恢复日常聊天。source 时间保留真实观测时刻，发布和重试不会刷新事实年龄。consent/dry-run 限制下不为清理而绕过最终门。
 - **投递**：`DeliveryDispatcher` 只保留一个 pending 战斗事件，每 tick 至多一次宿主最终尝试，事件有 TTL。所有 `read`/`respond`/`context`/`expire`/`test` 都必须经过 `HostPushGate`；不存在绕过 gate 的直接推送。
 - **回执**：只有显式 `accepted` 才算 SDK 本地提交；`legacy_unconfirmed` 和 `unknown` 永远不当作已接受。**SDK `submitted` 只表示本地提交，不代表宿主 LLM 已生成、TTS 已播放或用户已听到。**
 
@@ -93,7 +101,7 @@ capture
    `%LOCALAPPDATA%\N.E.K.O\.neko-plugin-installations\plugins\kards_companion\`。
    旧文档中的 `%LOCALAPPDATA%\N.E.K.O\plugins\kards_companion\` 不是首选位置。
 3. 本插件 id 为 `kards_companion`，与商店旧版同 id。先卸载/停用旧版，避免双实例。
-4. 启动 N.E.K.O，确认插件列表加载 `6.0.0`。
+4. 启动 N.E.K.O，确认插件列表加载 `6.0.1`。
 
 ### 开发通道
 
@@ -109,7 +117,7 @@ py -3.11 scripts\sync_installations.py --apply --channel dev
 - `[plugin_runtime].auto_start = true`，且 `[kards].auto_start_monitoring = true`。插件启动后会自动开始监控；游戏未启动时进入安全暂停，不会用旧帧推断对局。
 - 面板有开始/停止、暂停/恢复、模式切换、dry-run 和感知设置。首次验证建议先开 dry-run，只写 `events.jsonl`，不真实推送。
 - 当前源码直接依赖宿主 Python 3.11 环境中的 `numpy`、`Pillow`；仓库没有 `vendor/`，不能当作完整离线依赖包分发。
-- 采集后端、OCR、检测模型或宿主接口缺失时，功能降级或暂停；缺失模型时单位事件静默，不会伪造。
+- 采集后端、检测模型或宿主接口缺失时，功能降级或暂停；模型未加载时对应任务静默，不会伪造。
 
 ## 配置
 
@@ -121,11 +129,8 @@ py -3.11 scripts\sync_installations.py --apply --channel dev
 | `dry_run` | `false` | 完整跑仲裁/安全链，最终 gate 为 no-op，只写 `events.jsonl` |
 | `llm_data_consent` | `true` | 为 `false` 时所有宿主 push（含 `expire`/`test`）为 0 次真实推送 |
 | `auto_start_monitoring` | `true` | 插件启动后自动开始监控 |
-| `perception_preset` | `balanced` | 采样预设：`low_cost` 15/8/3/5，`balanced` 20/10/4/8，`quality` 30/12/5/10；`custom` 使用四项 FPS |
-| `capture_fps` / `change_fps` / `hud_fps` / `unit_fps` | `20` / `10` / `4` / `8` | 采集、变化检测、HUD OCR、单位跟踪 FPS |
-| `roi_auto_calibrate` | `true` | 只接受高置信 `frontline` / `end_turn_button` / `hq` 锚点 |
-| `recording_enabled` | `false` | 局内临时帧录制，默认关闭 |
-| `recording_max_mb` | `2048` | 滚动上限 MiB；面板允许 `64..65536`，2 GiB 只是默认值 |
+| `perception_preset` | `balanced` | 采样预设：`low_cost` 15/8/2/3，`balanced` 20/10/4/6，`quality` 30/12/6/10（采集/变化/界面/卡牌）；`custom` 使用四项 FPS |
+| `capture_fps` / `change_fps` / `unit_fps` / `card_fps` | `20` / `10` / `4` / `6` | 采集、变化检测、界面识别、卡牌识别 FPS（目标值，面板同时显示实测频率） |
 | `min_priority` | `4` | 事件解说最低优先级 |
 | `cooldown_seconds` | `25.0` | 普通事件冷却 |
 | `critical_cooldown_seconds` | `5.0` | 关键事件冷却 |
@@ -143,7 +148,7 @@ py -3.11 scripts\sync_installations.py --apply --channel dev
 | `vlm_enabled` | `false` | 可选 VLM 兜底；密钥只从 `KARDS_VLM_API_KEY` 读取，绝不写入配置 |
 | `imported_deck_code` | `""` | `deck_import` 写入的卡组代码 |
 
-录制器的 `jpeg_quality=85`、原始分辨率、`scope=match` 固定在代码中；面板只暴露开关和容量。局末/停止会清理本局临时帧，容量上限由用户设置，不是 2 GiB 硬上限。
+`perception_preset` 与四项 FPS 均支持热更新；面板同时展示目标值与实测频率。
 
 ## 动作
 
@@ -161,7 +166,7 @@ py -3.11 scripts\sync_installations.py --apply --channel dev
 | `monitor_diagnostics` | 无 | 诊断时间线、gate 回执、模拟记录、最后快照 |
 | `mode_set` | `{ "mode": "companion" \| "coach" \| "silent" }` | 切换解说模式 |
 | `dry_run_set` | `{ "enabled": true \| false }` | 切换完整模拟/最终不推送 |
-| `perception_settings_set` | `perception_preset`、四项 FPS、`roi_auto_calibrate`、`recording_enabled`、`recording_max_mb` | 严格白名单；未知字段拒绝 |
+| `perception_settings_set` | `perception_preset`、四项 FPS（capture/change/unit/card） | 严格白名单；未知字段拒绝；旧 `hud_fps`/`roi_auto_calibrate`/`recording_*` 键兼容忽略并告警 |
 
 ### 后端接口/开发调试
 
@@ -187,12 +192,11 @@ py -3.11 scripts\sync_installations.py --apply --channel dev
 ## 数据与读屏边界
 
 - **读屏只读**：不读游戏内存、不抓包、不注入键鼠、不自动出牌或操作界面。
-- **图像不外发**：采集帧只在内存中处理；不上传截图、裁剪图、原始 OCR 文本或 prompt。诊断时间线只保留阶段、结果、原因和结构化元数据。
+- **图像不外发**：采集帧只在内存中处理，不落盘；不上传截图、裁剪图或 prompt。诊断时间线只保留阶段、结果、原因和结构化元数据。
 - **可选联网**：卡牌目录更新默认关闭；启用后失败保留本地数据，自定义 URL 做 SSRF 校验。VLM 默认关闭，密钥只从环境变量读取。两者都不是运行必需。
 - **用户聊天 hook**：只记录用户发言的**时间**和目标是否存在；不读取、不保存聊天文字或语音转写。安静窗只影响普通播报，不阻断 `read` 通道。
-- **卡图**：`knowledge/cards_builtin.json` 有 1083 张卡的文本元数据和卡图来源 URL，但公开再分发授权未确认。`assets/cards/` 不存在，`OfflineCardAssetIndex()` 返回 `blocked`（`assets_dir_missing`），公开门禁为 `blocked_unlicensed`。模块没有下载公网图片的代码；不要把卡图写成已内置或已授权。
-- **录制**：默认关闭，仅本地写盘。JPEG 质量 85、原始分辨率、仅局内；容量由用户设定并按写入顺序滚动；局末/停止清理本局临时帧。录制不会把图像发给宿主 LLM。
-- **卡名/指令牌**：卡名匹配链未接通；`deck_import` 只保存卡组，不证明画面能识别卡名。指令牌环形缓冲代码存在，稳定识别/放大卡面未完成。
+- **卡图**：`knowledge/cards_builtin.json` 有 1083 张卡的文本元数据和卡图来源 URL，公开再分发授权未确认；图片字节不随插件分发。运行时认卡只依赖 card_cls 模型权重，不需要卡图文件。
+- **卡名**：由卡牌分类 YOLO 产生，白名单（`knowledge/trusted_cards.json`）之外输出 `unknown`；`deck_import` 只保存卡组代码，不代表画面能识别卡名。
 
 ### 采集后端
 
@@ -202,7 +206,7 @@ py -3.11 scripts\sync_installations.py --apply --channel dev
 2. `dxcam` 桌面复制；
 3. `PIL.ImageGrab` 降级。
 
-host WGC 是显式 opt-in，不是默认路径，也没有 6.0.0 真实宿主验收。`dxcam`/`ImageGrab` 读取桌面，要求 KARDS 在前台并通过已知顶层窗口的遮挡检查；`occlusion_detection` 公开为 `unavailable`，因此后台、被遮挡、独占全屏和虚拟桌面切换的行为**未证实**，不能承诺“后台可读”。健康状态包括 `disabled`、`process_not_found`、`window_not_found`、`minimized`、`frame_unavailable`、`stale_frame`、`capturing`、`degraded`、`stopped`。
+host WGC 是显式 opt-in，不是默认路径，也没有 6.0.1 真实宿主验收。`dxcam`/`ImageGrab` 读取桌面，要求 KARDS 在前台并通过已知顶层窗口的遮挡检查；`occlusion_detection` 公开为 `unavailable`，因此后台、被遮挡、独占全屏和虚拟桌面切换的行为**未证实**，不能承诺“后台可读”。健康状态包括 `disabled`、`process_not_found`、`window_not_found`、`minimized`、`frame_unavailable`、`stale_frame`、`capturing`、`degraded`、`stopped`。
 
 ### consent、dry-run 与回执
 
@@ -218,34 +222,33 @@ host WGC 是显式 opt-in，不是默认路径，也没有 6.0.0 真实宿主验
 | --- | --- |
 | `worker/bootstrap.py`、`protocol.py`、`package_check.py` | 存在；JSON-lines v1 的 `ping`/`selfcheck`/`shutdown` 可用，`frame.process` 未实现 |
 | `vendor/python/`、`vendor/python/Lib/site-packages/` | 缺失 |
-| `models/kards_det.onnx`（可选） | 缺失；单位/前线识别静默 |
+| `models/ui_det.onnx`、`models/card_cls.onnx`（可选） | 部署产物；不在 git |
 | `assets/cards/manifest.json` | 缺失 |
-| `ocr_models/runtime.json` | 缺失 |
 | `bundle-manifest.json` | 未生成 |
 | `worker-runtime.json` | 未生成（可选） |
 | `requirements-bundle.txt` | `BLOCKED_PENDING_BUILD` 模板，不是 pip lock，不能直接安装 |
 | `THIRD_PARTY_NOTICES.md` | `BLOCKED_PENDING_BUILD` 模板，禁止直接发布 |
 
-因此 `py -3.11 worker/bootstrap.py --check` 的预期结果是退出码 `2`、`status=blocked`。blocked 资源包括 distribution manifest、assets manifest、OCR runtime、vendor、vendored Python/site-packages、第三方声明；`model:kards_det` 为 `missing`。检查过程不会创建目录、下载资源或改写 manifest。
+因此 `py -3.11 worker/bootstrap.py --check` 的预期结果是退出码 `2`、`status=blocked`。blocked 资源包括 distribution manifest、assets manifest、vendor、vendored Python/site-packages、第三方声明。检查过程不会创建目录、下载资源或改写 manifest。
 
 `worker-runtime.json` 是可选的自检元数据；缺失时 `--check` 最多为 `degraded`，不会达到 `ready`。要发布 `ready` 包，构建必须生成它，并证明所有依赖的 import origin 都在 `vendor/` 内。
 
-**不能把当前仓库称为完整离线包。** 构建完整包必须补齐 vendor、assets/OCR runtime、真实第三方许可证、manifest 和构建生成的 lock，见 `docs/offline-bundle.md`。
+**不能把当前仓库称为完整离线包。** 构建完整包必须补齐 vendor、assets、真实第三方许可证、manifest 和构建生成的 lock，见 `docs/offline-bundle.md`。
 
 ## 训练状态
 
-训练工具和数据集位于仓库外的同级 `training/`，不随插件发布。raw 帧来自本地 NVIDIA 录屏素材，原始视频不入库。
+训练工具和数据集位于仓库外的同级 `training/`（脚本 `training/yolo_ui/`、`training/yolo_card/`），不随插件发布。raw 帧来自本地 NVIDIA 录屏素材，原始视频不入库、只读。
 
-按 `training/docs/reviewed-dataset-pipeline.md` 的当前快照：
+当前快照（详见 `training` 侧 REPORT 与 `docs/contracts-yolo-v1.md`）：
 
-- `dataset/raw`：939 张图 / 939 个标注，4050 个框，8 个录屏组；raw 标注**未完成人工复核**，不能当作 gold data。
-- 类别缺口：`hq` 为 0 个框（硬阻塞）；`card_hand` 24 个框、`played_card` 83 个框，覆盖不足。
-- 旧 `dataset/images` 是按图片随机切分的旧划分，同一录屏的相邻帧可能跨 train/val，**分组泄漏问题未解决**。`training/tools/` 的按录屏组切分只完成 dry-run/校验逻辑，`dataset/reviewed` 尚未生成（此前还受磁盘空间阻塞）。
-- 不自动训练；不导出或替换 `models/kards_det.onnx`。补标并生成 reviewed 数据前，现有模型和插件都不应更新。
+- 界面检测（ui_det）：8 个录屏组、组级切分 train 388 / val 172 / test 127；启发式预标（provenance 完整保留）；yolo11s 640。冻结线判定：card_back、end_turn_button 达标，frontline / unit_board / card_hand / played_card 未达标（标签噪声上限），hq / end_turn_active / victory / defeat 零样本 unsupported。
+- 卡牌分类（card_cls）：1083 类公开卡图训练（weserv 代理取官方图）；60 类同画变体标记 conflict 恒 unknown；真实画面独立验证按 card_id × 外观白名单门控。
+- ONNX 导出均通过源框架一致性对比与 CPU 推理验证。
+- 同日跨 split 的会话级泄漏风险、以及启发式标签噪声的量化上限，均在训练报告如实声明。
 
 ## 测试
 
-`tests/` 当前有 25 个 `test_*.py`。准确通过数以实际运行的命令输出为准；`docs/backend-parity.md` 记录过一次 `345 passed` 的本地快照，但该数字不作为固定值。
+测试数量以当前命令输出为准。历史通过数字不代表当前模型或识别质量通过；测试覆盖、真实 ONNX 加载、离线画面效果和宿主加载分别记录，见 [第一版说明](docs/v1-closure.md)。
 
 ```bat
 py -3.11 -m pytest tests -q
@@ -263,11 +266,11 @@ py -3.11 scripts\host_acceptance.py --probe
 
 发布前必须同时满足：
 
-1. **bundle 完整**：`vendor/python/`、`vendor/python/Lib/site-packages/`、`assets/cards/manifest.json`、`ocr_models/runtime.json`、`bundle-manifest.json`、`worker-runtime.json`、构建生成的 lock 和核验后的第三方声明都存在；`worker/bootstrap.py --check` 达到 `ready`。禁止用空文件、假 vendor、假许可证或首次运行下载“通过”门禁。
-2. **卡图授权**：公开卡图的再分发授权未确认前，`distribution_status` 保持 `blocked_unlicensed`；不得声明 `licensed_public_release`，也不得公开分发卡图。`kards_det.onnx` 的来源和分发权利需单独核验。
+1. **bundle 完整**：`vendor/python/`、`vendor/python/Lib/site-packages/`、`assets/cards/manifest.json`、`bundle-manifest.json`、`worker-runtime.json`、构建生成的 lock 和核验后的第三方声明都存在；`worker/bootstrap.py --check` 达到 `ready`。禁止用空文件、假 vendor、假许可证或首次运行下载“通过”门禁。
+2. **卡图授权**：公开卡图的再分发授权未确认前，`distribution_status` 保持 `blocked_unlicensed`；不得声明 `licensed_public_release`，也不得公开分发卡图。ONNX 权重的来源和分发权利需单独核验。
 3. **宿主验收**：formal apply 需要真实报告包含 `plugin_loaded=true`、`delivery.submitted=true`、`sdk.accepted=true`，且 `source_manifest`/`artifact` fingerprint 与当前源一致；两个 dev 副本需先同步。`scripts/host_acceptance.py` 当前的 `neko-host-acceptance/1` 报告不含这些字段，**不能直接作为 formal 证据**。
 4. **UI 实机渲染**：`ui/panel.tsx` 目前只做过静态检查；宿主渲染和动作路由未验证前不能发布正式版。
-5. **版本**：当前清单版本为 `6.0.0`；正式同步脚本不会越过验收证据修改通道身份或写入正式目录。
+5. **版本**：当前清单版本为 `6.0.1`；正式同步脚本不会越过验收证据修改通道身份或写入正式目录。
 
 在这些条件满足前，只能使用 dev 通道做只读/模拟验证，不执行 formal apply。
 
@@ -279,4 +282,4 @@ py -3.11 scripts\host_acceptance.py --probe
 - KARDS 的名称与卡图权利归其权利人；本插件与 KARDS 发行方无隶属、赞助或授权关系。
 - `THIRD_PARTY_NOTICES.md` 仍是 `BLOCKED_PENDING_BUILD` 模板；离线包发布前必须逐项核验版本、许可证文本、版权行和来源，不能补写猜测值。第三方组件的许可证声明以构建时核验结果为准，本文不替任何组件作推断。
 
-更多接口与部署细节见 `docs/backend-integration-contract.md`、`docs/backend-parity.md`、`docs/deployment.md`、`docs/offline-bundle.md`、`docs/recording.md`、`docs/card-assets.md`、`docs/host-acceptance.md`。
+更多接口与部署细节见 `docs/backend-integration-contract.md`、`docs/backend-parity.md`、`docs/deployment.md`、`docs/offline-bundle.md`、`docs/card-assets.md`、`docs/host-acceptance.md`、`docs/contracts-yolo-v1.md`。

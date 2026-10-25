@@ -18,6 +18,7 @@ preserved across retries: ``now + ttl`` is never recomputed.
 from __future__ import annotations
 
 import copy
+import math
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -34,7 +35,6 @@ from ..delivery.contracts import (
     REASON_CONSENT_REQUIRED,
     REASON_DRY_RUN,
     REASON_PAUSED,
-    REASON_SIMULATED,
     REASON_STALE_CONTEXT,
     REASON_STALE_EPOCH,
     REASON_STOPPED,
@@ -47,6 +47,8 @@ from ..delivery.contracts import (
 from ..delivery.publisher import (
     PublishStatus,
     build_commentary_prompt,
+    build_live_state_text,
+    situation_payload,
 )
 from ..runtime.contracts import (
     CATEGORY_CRITICAL,
@@ -84,6 +86,12 @@ _SUPPRESS_REASONS = frozenset({
 _READ_LIKE_EVENT_KINDS = frozenset({
     "unit_played", "unit_died", "unit_advanced", "order_card_seen",
     E_MATCH_END,
+})
+
+# Local source-freshness rejections from the publisher: not transport failures.
+_STALE_SOURCE_REASONS = frozenset({
+    "source_expired", "source_invalid", "context_invalid",
+    "situation_invalid",
 })
 
 
@@ -311,10 +319,11 @@ class DeliveryDispatcher:
                                else (known_targets if callable(known_targets)
                                      else self.config.known_targets))
         self._prompt = prompt_builder or (
-            lambda summary, state: build_commentary_prompt(
-                summary, state, mode=getattr(
-                    getattr(self._arbiter, "config", None), "mode", "companion"),
-                max_chars=self.config.reply_max_chars))
+            lambda summary, state, event=None, now=None: build_commentary_prompt(
+                summary, state, event=event,
+                mode=getattr(getattr(self._arbiter, "config", None),
+                             "mode", "companion"),
+                max_chars=self.config.reply_max_chars, now=now))
         self._lock = threading.RLock()
         self._pending: _Pending | None = None
         self._state: MatchState | None = None
@@ -340,6 +349,7 @@ class DeliveryDispatcher:
             "suppressed": 0, "route_unavailable": 0, "quiet_window": 0,
             "passive_context": 0, "read_submitted": 0, "read_coalesced": 0,
             "read_failed": 0, "read_suppressed": 0, "read_unconfirmed": 0,
+            "read_stale": 0,
         }
         self._refresh_config_locked()
 
@@ -381,7 +391,6 @@ class DeliveryDispatcher:
         if not isinstance(config, DispatcherConfig):
             raise TypeError("config must be DispatcherConfig")
         with self._lock:
-            old = self.config
             self.config = config
             self._refresh_config_locked()
             # ``update_config`` always invalidates admissions: the gate token
@@ -772,7 +781,6 @@ class DeliveryDispatcher:
                       route: TargetResolution, current: float,
                       order: int = 0, token: str = "") -> _Pending:
         expires_at = self._expires_at(event, current)
-        event_ts = float(getattr(event, "ts", 0.0) or 0.0)
         return _Pending(
             event=_copy_event(event),
             state=_copy_state(state),
@@ -971,7 +979,6 @@ class DeliveryDispatcher:
             # If select() denied everything, a time-based denial (cooldown) may
             # still be worth waiting for until the event's own TTL.
             wait_candidate: GameEvent | None = None
-            wait_decision: Any = None
             if selected is None and events:
                 best_rank = None
                 for index, event in enumerate(events):
@@ -989,12 +996,11 @@ class DeliveryDispatcher:
                         continue
                     rank = self._rank(event, index)
                     if best_rank is None or rank > best_rank:
-                        wait_candidate, wait_decision, best_rank = event, decision, rank
+                        wait_candidate, _, best_rank = event, decision, rank
                 if wait_candidate is not None:
                     selected = wait_candidate
                     selected_index = events.index(wait_candidate)
 
-            newly_queued = False
             handled_early: set[int] = set()
             if selected is not None:
                 chosen_decision = (decisions[selected_index]
@@ -1027,7 +1033,6 @@ class DeliveryDispatcher:
                         if pending is None:
                             self._pending = candidate
                             pending = candidate
-                            newly_queued = True
                             self._counters["queued"] += 1
                             self._record("dispatcher", "queued",
                                          _decision_reason(chosen_decision)
@@ -1039,7 +1044,6 @@ class DeliveryDispatcher:
                                 old = pending
                                 self._pending = candidate
                                 pending = candidate
-                                newly_queued = True
                                 self._counters["replaced"] += 1
                                 self._record("dispatcher", "replaced",
                                              "target_changed", current,
@@ -1057,7 +1061,6 @@ class DeliveryDispatcher:
                                 old = self._pending or pending
                                 self._pending = candidate
                                 pending = candidate
-                                newly_queued = True
                                 self._counters["replaced"] += 1
                                 self._record("dispatcher", "replaced", reason,
                                              current, item=old,
@@ -1237,27 +1240,78 @@ class DeliveryDispatcher:
                 return text
         return ""
 
+    def _make_prompt(self, item: _Pending, current: float) -> str:
+        """Call the prompt builder with event context, tolerating old callers."""
+        event = item.event
+        attempts: tuple[dict[str, Any], ...] = (
+            {"event": event, "now": current},
+            {"event": event},
+            {},
+        )
+        for extra in attempts:
+            try:
+                return str(self._prompt(event.summary, item.state, **extra))
+            except TypeError:
+                continue
+        return str(self._prompt(event.summary, item.state))
+
+    @staticmethod
+    def _state_source_time(state: MatchState,
+                           current: float) -> tuple[float | None, str, bool]:
+        """Real source observation time for the queued state snapshot."""
+        try:
+            payload = situation_payload(state)
+        except Exception:
+            payload = {}
+        source = payload.get("source") if isinstance(payload, Mapping) else None
+        if isinstance(source, Mapping):
+            for key in ("ui_observed_at", "observed_at"):
+                try:
+                    value = float(source.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if value > 0 and math.isfinite(value):
+                    valid = value <= current + 0.001
+                    return value, f"situation.source.{key}", valid
+        try:
+            value = float(getattr(state, "detected_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0 and math.isfinite(value):
+            return value, "state.detected_at", value <= current + 0.001
+        return None, "missing", False
+
     def _build_payload(self, item: _Pending, current: float
                        ) -> tuple[dict[str, Any], dict[str, Any]]:
         event = item.event
-        spec = event_spec(event)
         level = event_level(event)
         edge = event_edge(event)
         details = event.details if isinstance(event.details, Mapping) else {}
         identity = str(details.get("identity") or event_identity(event))
         event_ts = float(getattr(event, "ts", 0.0) or 0.0)
-        event_age = max(0.0, current - event_ts) if event_ts > 0 else 0.0
+        event_time_valid = event_ts > 0 and event_ts <= current + 0.001
+        event_age = (max(0.0, current - event_ts)
+                     if event_ts > 0 and event_ts <= current else 0.0)
         event_max_age = event_max_age_seconds(event, self._delivery_ttl)
-        event_expires = self._expires_at(event, current)
-        # TTL is the *current* remaining time, not the initial queue lifespan.
+        # The admission deadline is the original source deadline; retries never
+        # refresh it.
+        event_expires = item.expires_at
+        # TTL is the *current* remaining delivery time, not the source max age.
         remaining = max(0.0, item.expires_at - current)
         priority = max(1, min(9, int(event.priority)))
         recommended = self._recommended_reply(event)
         plugin_owned = bool(self.config.plugin_owned_output_enabled and recommended)
-        replace_pending = bool(item.terminal or item.critical)
+        # The host contract is a single battle-event replace slot.  Only a
+        # confirmed own-side critical preempts (interrupts) the host.
+        replace_pending = True
         interrupt_pending = bool(item.critical)
-        interrupt_battle_event = bool(item.critical)
         target = item.target_lanlan
+        state_ts, state_origin, state_valid = self._state_source_time(
+            item.state, current)
+        state_age = (max(0.0, current - state_ts)
+                     if state_ts is not None and state_valid else None)
+        output_mode = ("plugin_owned_visible_chat" if plugin_owned
+                       else "host_respond")
 
         callback_contract = {
             "version": "neko.callback.v1",
@@ -1267,14 +1321,18 @@ class DeliveryDispatcher:
                 "replace_pending": replace_pending,
                 "interrupt_pending": interrupt_pending,
                 "priority": priority,
-                "expires_at": round(item.expires_at, 3),
-                "max_age_seconds": round(remaining, 3),
+                # Source deadline, never the remaining TTL.
+                "expires_at": round(event_expires, 3),
+                # Source event max age spec.
+                "max_age_seconds": round(event_max_age, 3),
+                "ttl_remaining_seconds": round(remaining, 3),
             },
             "freshness": {
                 "event_ts": round(event_ts, 3) if event_ts > 0 else None,
                 "event_age_seconds": round(event_age, 3),
                 "event_max_age_seconds": round(event_max_age, 3),
                 "event_expires_at": round(event_expires, 3),
+                "event_time_valid": bool(event_time_valid),
             },
             "target": {"lanlan": target},
         }
@@ -1288,26 +1346,61 @@ class DeliveryDispatcher:
             "coalesce_key": self.config.coalesce_key,
             "kind": event.kind,
             "delivery_intent": "commentary",
+            "delivery_mode": output_mode,
             "priority": priority,
             "match_id": details.get("game", item.match_id),
             "session_id": item.session_id,
             "attempt": item.attempts + 1,
             "replace_pending": replace_pending,
             "interrupt_pending": interrupt_pending,
-            "interrupt_battle_event": interrupt_battle_event,
-            "battle_reply_contract": "short_tts_line",
-            "reply_contract": "short_tts_line",
-            "delivery_reply_contract": "short_tts_line",
-            "max_reply_chars": int(self.config.reply_max_chars),
-            "reply_max_chars": int(self.config.reply_max_chars),
+            "interrupt_battle_event": interrupt_pending,
+            "replace_pending_intent": True,
+            "live_reply_contract": "short_tts_line",
+            "plugin_recommended_reply": recommended,
+            # Legacy host alias for the recommended line.
             "recommended_reply": recommended,
+            "plugin_owned_output": plugin_owned,
+            "plugin_owned_output_enabled": plugin_owned,
+            "reply_style_contract": "one_sentence_only",
+            "domain_prompt_contract": "kards_commentary_v1",
+            "response_module_hint": ("plugin_owned_blind_chat" if plugin_owned
+                                     else "host_llm_commentary"),
+            "dialogue_policy_owner": "plugin",
+            "plugin_dialogue_policy": {
+                "owner": "plugin",
+                "pace": "plugin",
+                "persona": "host",
+                "reply_style": "short_commentary",
+                "output_mode": output_mode,
+            },
+            "plugin_quiet_window_policy": {
+                "owner": "plugin",
+                "mode": self.config.interrupt_mode,
+                "user_chat_quiet_window_seconds": round(
+                    float(self.config.user_chat_quiet_window_seconds), 3),
+                "battle_output_quiet_window_seconds": round(
+                    float(self.config.battle_output_quiet_window_seconds), 3),
+                "battle_output_backpressure_seconds": round(
+                    float(self.config.battle_output_backpressure_seconds), 3),
+                "critical_interrupts": interrupt_pending,
+            },
+            # Legacy host reader alias (connection-test metadata uses it too).
+            "battle_reply_contract": "short_tts_line",
+            "max_reply_chars": int(self.config.reply_max_chars),
             "host_callback_contract_version": "neko.callback.v1",
             "host_callback_contract": callback_contract,
             "event_ts": round(event_ts, 3) if event_ts > 0 else None,
+            "event_time_valid": bool(event_time_valid),
             "event_age_seconds": round(event_age, 3),
             "event_max_age_seconds": round(event_max_age, 3),
             "event_expires_at": round(event_expires, 3),
+            "state_observed_at": round(state_ts, 3) if state_ts is not None else None,
+            "state_age_seconds": round(state_age, 3) if state_age is not None else None,
+            "state_source_origin": state_origin,
+            "state_time_valid": bool(state_valid),
+            "state_source": "event_time_snapshot",
             "delivery_expires_at": round(item.expires_at, 3),
+            # Current remaining delivery TTL (source max age is separate).
             "delivery_ttl_seconds": round(remaining, 3),
             "target_lanlan_present": bool(target),
             # Capability is genuinely unknown; do not pretend false/true.
@@ -1316,24 +1409,30 @@ class DeliveryDispatcher:
                 "interrupt_pending": "unknown",
                 "blind_visible_chat": "unknown",
             },
-            "plugin_owned_output_enabled": bool(
-                self.config.plugin_owned_output_enabled),
+            "host_capabilities_source": "unknown",
+            "plugin_source": self.config.source,
+            "local_submission_only": True,
+            "sdk_submission_semantics":
+                "immediate_local_submission_not_host_consumption",
+            "llm_generated": "unknown",
+            "tts_played": "unknown",
         }
         if target:
             metadata["target_lanlan"] = target
-        prompt = self._prompt(event.summary, item.state)
         if plugin_owned:
-            # Opt-in "blind" visible chat: show the already-validated short
-            # line, never the instruction prompt, in the chat bubble.
+            # Opt-in blind visible chat: the plugin already owns the validated
+            # line, so the host must not generate/invoke the LLM for it.
             body = recommended
-            metadata["delivery_mode"] = "plugin_owned_visible_chat"
+            ai_behavior = "blind"
+            visibility = ["chat"]
         else:
-            body = prompt
-            metadata["delivery_mode"] = "host_respond"
+            body = self._make_prompt(item, current)
+            ai_behavior = "respond"
+            visibility = []
         kwargs: dict[str, Any] = {
             "source": self.config.source,
-            "visibility": ["chat"] if plugin_owned else [],
-            "ai_behavior": "respond",
+            "visibility": visibility,
+            "ai_behavior": ai_behavior,
             "parts": [{"type": "text", "text": body}],
             "priority": priority,
             "coalesce_key": self.config.coalesce_key,
@@ -1352,7 +1451,13 @@ class DeliveryDispatcher:
             return False
         if not self._read_breaker.allow(now=current):
             return False
-        text = _clean_text(item.event.summary, 160) or f"KARDS:{item.event.kind}"
+        try:
+            # The read channel carries the event-time state snapshot, not a
+            # summary relabelled as a "current" observation.
+            text = build_live_state_text(
+                item.state, session_id=item.session_id)
+        except Exception:
+            text = _clean_text(item.event.summary, 160) or f"KARDS:{item.event.kind}"
         try:
             result = self._read_publisher.publish(
                 item.state, text=text, target=item.target_lanlan,
@@ -1384,6 +1489,11 @@ class DeliveryDispatcher:
                           "unconfirmed_receipt"}:
                 # Unconfirmed is terminal, not a transport failure.
                 self._release_probe(self._read_breaker)
+            elif reason in _STALE_SOURCE_REASONS:
+                # A stale/invalid source is a local rejection: no host attempt,
+                # no breaker failure.
+                self._release_probe(self._read_breaker)
+                self._counters["read_stale"] += 1
             else:
                 self._read_breaker.record_failure(now=current)
             return False
@@ -1609,6 +1719,7 @@ class DeliveryDispatcher:
     def push_read(self, state: MatchState, *, text: str, target: str = "",
                   target_lanlan: str = "", session_id: str = "",
                   context_token: str | None = None,
+                  source_observed_at: float | None = None,
                   now: float | None = None) -> bool:
         """Push passive live-state text without consuming respond pacing.
 
@@ -1626,9 +1737,13 @@ class DeliveryDispatcher:
                 self._record("read", "circuit_open", "safety_open", current)
                 return False
             try:
-                result = self._read_publisher.publish(
-                    state, text=text, target=route, session_id=session_id,
-                    context_token=context_token, now=current)
+                publish_kwargs: dict[str, Any] = {
+                    "text": text, "target": route, "session_id": session_id,
+                    "context_token": context_token, "now": current,
+                }
+                if source_observed_at is not None:
+                    publish_kwargs["source_observed_at"] = source_observed_at
+                result = self._read_publisher.publish(state, **publish_kwargs)
             except Exception as exc:
                 self._read_breaker.record_failure(now=current)
                 self._counters["read_failed"] += 1
@@ -1663,6 +1778,12 @@ class DeliveryDispatcher:
                     self._release_probe(self._read_breaker)
                     self._counters["read_unconfirmed"] += 1
                     self._record("read", "unconfirmed", reason, current)
+                    return False
+                if reason in _STALE_SOURCE_REASONS:
+                    # Local source rejection: no host attempt happened.
+                    self._release_probe(self._read_breaker)
+                    self._counters["read_stale"] += 1
+                    self._record("read", "stale", reason, current)
                     return False
                 self._read_breaker.record_failure(now=current)
                 self._counters["read_failed"] += 1

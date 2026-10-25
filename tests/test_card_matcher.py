@@ -1,6 +1,5 @@
-from PIL import Image, ImageDraw
-
 from kards_companion.perception.card_matcher import CardMatcher
+from PIL import Image, ImageDraw
 
 
 def art(seed_colors: tuple[tuple[int, int, int], tuple[int, int, int]]) -> Image.Image:

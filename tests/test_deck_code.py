@@ -1,5 +1,4 @@
 import pytest
-
 from kards_companion.knowledge.deck_code import DeckCodeError, encode_deck_code, parse_deck_code
 
 

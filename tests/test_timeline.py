@@ -1,5 +1,4 @@
 import pytest
-
 from kards_companion.runtime import timeline as timeline_module
 from kards_companion.runtime.timeline import RuntimeTimeline, TimelineEntry
 

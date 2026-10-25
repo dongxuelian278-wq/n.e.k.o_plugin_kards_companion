@@ -1,11 +1,13 @@
 """Single-slot dispatcher behavior, gate integration and policy boundaries."""
 
+import json
 from dataclasses import replace
 
 from kards_companion.delivery.arbiter import ArbiterConfig, CommentaryArbiter
 from kards_companion.delivery.publisher import (
     PublishResult,
     PublishStatus,
+    build_commentary_prompt,
 )
 from kards_companion.policy.dispatcher import (
     DeliveryDispatcher,
@@ -21,7 +23,6 @@ from kards_companion.policy.safety import (
 )
 from kards_companion.runtime.contracts import IN_MATCH
 from kards_companion.state.model import (
-    E_CHATTER,
     E_HQ_CRITICAL,
     E_HQ_DAMAGE,
     E_MATCH_END,
@@ -53,19 +54,20 @@ class Recorder:
 
 
 class FakeReadPublisher:
-    def __init__(self, status="submitted") -> None:
+    def __init__(self, status="submitted", reason="") -> None:
         self.status = status
+        self.reason = reason
         self.calls: list[dict] = []
 
     def publish(self, state, *, text, target="", session_id="",
-                context_token=None, now=None):
+                context_token=None, source_observed_at=None, now=None):
         self.calls.append({
             "state": state, "text": text, "target": target,
             "session_id": session_id, "context_token": context_token,
-            "now": now,
+            "source_observed_at": source_observed_at, "now": now,
         })
         return PublishResult(PublishStatus(self.status), target=target,
-                             reason=self.status)
+                             reason=self.reason or self.status)
 
 
 def make_arbiter(**overrides) -> CommentaryArbiter:
@@ -140,8 +142,10 @@ def event(kind: str = E_HQ_DAMAGE, *, occurrence: int = 1,
 
 
 def state(**kw) -> MatchState:
+    # Explicit capture time: production state always has one, and FakeClock
+    # tests must not compare a wall-clock default with the injected clock.
     base: dict = {"game_number": 1, "in_match": True, "my_hq": 20,
-                  "enemy_hq": 20}
+                  "enemy_hq": 20, "detected_at": 1000.0}
     base.update(kw)
     return MatchState(**base)
 
@@ -172,7 +176,10 @@ def test_tick_batch_selects_highest_not_first_and_metadata_contract() -> None:
     assert "replace_pending" not in call
     assert "interrupt_pending" not in call
     assert "interrupt_battle_event" not in call
-    assert metadata["replace_pending"] is False
+    # Every normal battle event uses the single host replace slot; only a
+    # confirmed own-side critical preempts/interrupts.
+    assert metadata["replace_pending"] is True
+    assert metadata["replace_pending_intent"] is True
     assert metadata["interrupt_pending"] is False
     assert metadata["interrupt_battle_event"] is False
     assert metadata["plugin"] == "kards"
@@ -182,33 +189,50 @@ def test_tick_batch_selects_highest_not_first_and_metadata_contract() -> None:
     assert metadata["event_id"].startswith("s1|1|hq_damage|mine|")
     assert metadata["edge"] in {"enter", "upgrade", "recovery", "steady"}
     assert metadata["level"] in {"info", "notice", "warning", "critical", "terminal"}
-    for key in ("battle_reply_contract", "reply_contract",
-                "delivery_reply_contract"):
+    for key in ("battle_reply_contract", "live_reply_contract"):
         assert metadata[key] == "short_tts_line"
     assert metadata["max_reply_chars"] == 28
-    assert metadata["reply_max_chars"] == 28
+    assert "reply_max_chars" not in metadata
+    assert "reply_contract" not in metadata
+    assert "delivery_reply_contract" not in metadata
+    assert metadata["plugin_recommended_reply"] == ""
     assert metadata["recommended_reply"] == ""
+    assert metadata["plugin_owned_output"] is False
+    assert metadata["reply_style_contract"] == "one_sentence_only"
+    assert metadata["domain_prompt_contract"] == "kards_commentary_v1"
+    assert metadata["response_module_hint"] == "host_llm_commentary"
+    assert metadata["dialogue_policy_owner"] == "plugin"
+    assert metadata["plugin_dialogue_policy"]["owner"] == "plugin"
+    assert metadata["plugin_dialogue_policy"]["pace"] == "plugin"
+    assert metadata["plugin_dialogue_policy"]["persona"] == "host"
+    assert metadata["plugin_quiet_window_policy"]["owner"] == "plugin"
     assert metadata["host_callback_contract_version"] == "neko.callback.v1"
     contract = metadata["host_callback_contract"]
+    assert "callback" not in metadata
     assert contract["version"] == "neko.callback.v1"
     assert contract["kind"] == "realtime_cue"
-    assert set(contract["delivery"]) >= {
+    assert set(contract["delivery"]) == {
         "coalesce_key", "replace_pending", "interrupt_pending", "priority",
-        "expires_at", "max_age_seconds"}
+        "expires_at", "max_age_seconds", "ttl_remaining_seconds"}
     assert set(contract["freshness"]) == {
         "event_ts", "event_age_seconds", "event_max_age_seconds",
-        "event_expires_at"}
+        "event_expires_at", "event_time_valid"}
     assert contract["target"] == {"lanlan": ""}
     assert metadata["host_capabilities"] == {
         "replace_pending": "unknown",
         "interrupt_pending": "unknown",
         "blind_visible_chat": "unknown",
     }
-    # TTL is current remaining time, not the initial queue lifespan.
+    # TTL is current remaining delivery time; max_age_seconds is the source
+    # event spec and expires_at is the original admission deadline.
     assert 0.0 < metadata["delivery_ttl_seconds"] <= 4.0
     assert metadata["event_ts"] == 998.0
     assert metadata["event_age_seconds"] == 2.0
-    assert contract["delivery"]["max_age_seconds"] == metadata["delivery_ttl_seconds"]
+    assert contract["delivery"]["max_age_seconds"] == metadata["event_max_age_seconds"]
+    assert contract["delivery"]["ttl_remaining_seconds"] == metadata["delivery_ttl_seconds"]
+    assert contract["delivery"]["expires_at"] == metadata["delivery_expires_at"]
+    assert metadata["state_observed_at"] == 1000.0
+    assert metadata["state_age_seconds"] == 0.0
     # Non-winners are reported as dropped, never as attempts.
     statuses = [outcome.status for outcome in outcomes]
     assert statuses.count("submitted") == 1
@@ -226,10 +250,14 @@ def test_plugin_owned_output_only_opted_in_with_trusted_short_line() -> None:
     call = push.calls[0]
     assert call["visibility"] == ["chat"]
     # Blind plugin-owned chat shows the validated line, not the prompt.
+    assert call["ai_behavior"] == "blind"
     assert call["parts"][0]["text"] == "稳住，别慌。"
+    assert call["metadata"]["plugin_recommended_reply"] == "稳住，别慌。"
     assert call["metadata"]["recommended_reply"] == "稳住，别慌。"
     assert call["metadata"]["delivery_mode"] == "plugin_owned_visible_chat"
+    assert call["metadata"]["plugin_owned_output"] is True
     assert call["metadata"]["plugin_owned_output_enabled"] is True
+    assert "respond" not in call
 
     # Default is the invisible respond channel even if a reply is supplied.
     dispatcher2, push2, clock2 = make_dispatcher()
@@ -237,10 +265,14 @@ def test_plugin_owned_output_only_opted_in_with_trusted_short_line() -> None:
         [event(E_HQ_DAMAGE, occurrence=1, ts=clock2.t,
                recommended_reply="稳住，别慌。")],
         state(), scenario=IN_MATCH, session_id="s", match_id=1, now=clock2.t)
-    assert push2.calls[0]["visibility"] == []
-    assert push2.calls[0]["metadata"]["plugin_owned_output_enabled"] is False
-    assert push2.calls[0]["metadata"]["delivery_mode"] == "host_respond"
-    assert push2.calls[0]["parts"][0]["text"] != "稳住，别慌。"
+    default_call = push2.calls[0]
+    assert default_call["visibility"] == []
+    assert default_call["ai_behavior"] == "respond"
+    assert "respond" not in default_call
+    assert default_call["metadata"]["plugin_owned_output"] is False
+    assert default_call["metadata"]["plugin_owned_output_enabled"] is False
+    assert default_call["metadata"]["delivery_mode"] == "host_respond"
+    assert default_call["parts"][0]["text"] != "稳住，别慌。"
 
 
 def test_single_slot_submit_drain_and_replacement() -> None:
@@ -637,7 +669,11 @@ def test_quiet_unit_result_downgrades_to_passive_read_context() -> None:
     assert [outcome.status for outcome in outcomes] == ["passive_context"]
     assert push.calls == []
     assert len(read.calls) == 1
-    assert read.calls[0]["text"] == "敌方单位阵亡。"
+    # The read channel carries the event-time state snapshot, with the real
+    # source timestamp, not a publication-time pseudo-observation.
+    assert read.calls[0]["text"].startswith("KARDS:")
+    assert '"observed_at":1000.0' in read.calls[0]["text"]
+    assert '"kind":"kards_summary"' in read.calls[0]["text"]
     stats = dispatcher.stats()
     assert stats["passive_context"] == 1
     assert stats["submitted"] == 0
@@ -759,3 +795,91 @@ def test_candidate_state_is_deep_copied_against_later_mutation() -> None:
     dispatcher.drain(now=clock.t)
     assert seen == [20]
     assert push.calls
+
+
+# ---------------------------------------------------------------- regressions
+
+def test_normal_payload_uses_only_verified_top_level_kwargs() -> None:
+    dispatcher, push, clock = make_dispatcher(
+        config=make_config(target_lanlan="lanlan"))
+    dispatcher.tick([event(E_HQ_DAMAGE, occurrence=1, ts=clock.t)], state(),
+                    scenario=IN_MATCH, session_id="s", match_id=1,
+                    now=clock.t)
+    call = push.calls[0]
+    assert set(call) == {
+        "source", "visibility", "ai_behavior", "parts", "priority",
+        "coalesce_key", "metadata", "target_lanlan",
+    }
+    assert "respond" not in call
+    assert call["visibility"] == []
+    assert call["ai_behavior"] == "respond"
+    assert call["target_lanlan"] == "lanlan"
+
+
+def test_payload_facts_use_event_time_state_source_and_age() -> None:
+    dispatcher, push, clock = make_dispatcher(
+        prompt_builder=build_commentary_prompt)
+    snapshot = state(detected_at=995.0, my_hq=17)
+    dispatcher.tick([event(E_HQ_DAMAGE, occurrence=1, ts=998.0)], snapshot,
+                    scenario=IN_MATCH, session_id="s", match_id=1,
+                    now=clock.t)
+    call = push.calls[0]
+    metadata = call["metadata"]
+    assert metadata["state_observed_at"] == 995.0
+    assert metadata["state_age_seconds"] == 5.0
+    assert metadata["state_source"] == "event_time_snapshot"
+    assert metadata["event_ts"] == 998.0
+    assert metadata["event_age_seconds"] == 2.0
+    prompt = call["parts"][0]["text"]
+    body = json.loads(prompt[prompt.index("{"):])
+    assert body["facts"]["source"]["observed_at"] == 995.0
+    assert body["facts"]["source"]["age_seconds"] == 5.0
+    assert body["facts"]["current"]["my_hq"] == 17
+
+
+def test_read_downgrade_stale_source_releases_half_open_probe() -> None:
+    clock = FakeClock()
+    read_breaker = SafetyCircuitBreaker(
+        SafetyConfig(failure_threshold=1, recovery_seconds=5.0,
+                     half_open_max_probes=1),
+        now_fn=clock)
+    read = FakeReadPublisher("failed", reason="transport")
+    dispatcher, push, _ = make_dispatcher(
+        clock, read_publisher=read, read_breaker=read_breaker,
+        config=make_config(user_chat_quiet_window_seconds=60.0))
+
+    assert not dispatcher.push_read(state(), text="X", now=clock.t)
+    assert read_breaker.state(now=clock.t) == OPEN
+    clock.t += 5.0
+
+    # A stale/invalid source is a local rejection: the half-open probe must be
+    # returned, not counted as a transport failure.
+    read.status = "failed"
+    read.reason = "source_expired"
+    assert not dispatcher.push_read(state(), text="X", now=clock.t)
+    assert read_breaker.state(now=clock.t) == "half_open"
+    assert read_breaker.snapshot(now=clock.t).probes == 0
+    assert dispatcher.stats()["read_stale"] == 1
+    assert push.calls == []
+
+
+def test_quiet_downgrade_stale_source_keeps_respond_probe_released() -> None:
+    clock = FakeClock()
+    breaker = SafetyCircuitBreaker(
+        SafetyConfig(failure_threshold=1, recovery_seconds=5.0,
+                     half_open_max_probes=1), now_fn=clock)
+    read = FakeReadPublisher("failed", reason="source_expired")
+    dispatcher, push, _ = make_dispatcher(
+        clock, push=Recorder(False), breaker=breaker, read_publisher=read,
+        config=make_config(max_attempts=1,
+                           user_chat_quiet_window_seconds=60.0))
+    dispatcher.note_user_chat(now=clock.t)
+    outcomes = dispatcher.tick(
+        [event(E_UNIT_DIED, occurrence=1, side="enemy", ts=clock.t)],
+        state(), scenario=IN_MATCH, session_id="s", match_id=1,
+        now=clock.t)
+    assert [outcome.status for outcome in outcomes] == ["quiet_window"]
+    assert push.calls == []
+    assert dispatcher.pending == 1
+    assert dispatcher.read_breaker_snapshot().state == CLOSED
+    assert dispatcher.stats()["read_stale"] == 1

@@ -8,7 +8,8 @@ These tests pin the orchestration guarantees that live only in ``__init__.py``:
 * the first trusted frame after a pause rebases the match tracker instead of
   diffing across the unseen gap;
 * every trusted non-dry-run tick drains the dispatcher, even with no candidate;
-* stop clears dispatcher queue, arbiter, tracker, HUD and capture state.
+* stop clears dispatcher queue, arbiter, tracker and capture state (HUD/录像
+  链路已移除)。
 
 The host SDK is stubbed by ``tests/conftest.py``.  Main-entry helpers are
 reused from :mod:`test_api_contract`, which loads ``__init__.py`` with the
@@ -24,22 +25,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
-from test_api_contract import (
-    FakeCapture,
-    FakeClassifier,
-    FakeConfig,
-    FakeHud,
-    FakeLogger,
-    FakeRecorder,
-    MAIN,
-    PLUGIN_CLASS,
-    blocked_health,
-    capture_result,
-    frame_stub,
-    trusted_health,
-)
-
 from kards_companion.state.model import (
     E_HQ_DAMAGE,
     E_MATCH_END,
@@ -49,6 +34,18 @@ from kards_companion.state.model import (
     SCENE_VICTORY,
     GameEvent,
     MatchState,
+)
+from test_api_contract import (
+    MAIN,
+    PLUGIN_CLASS,
+    FakeCapture,
+    FakeClassifier,
+    FakeConfig,
+    FakeLogger,
+    FakeUiDetector,
+    blocked_health,
+    capture_result,
+    trusted_health,
 )
 
 
@@ -79,14 +76,23 @@ def plugin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     monkeypatch.setattr(base, "push_message", record_push, raising=False)
     instance = PLUGIN_CLASS(ctx=object())
     instance.config = FakeConfig()
-    instance.classifier = None
-    instance.hud = None
     instance._events_log = []
     instance.pushes = pushes
     instance.scheduler.due = lambda *args, **kwargs: True
-    monkeypatch.setattr(
-        MAIN, "client_bbox", lambda _window: (0, 0, 8, 8), raising=False)
+    # 编排测试不关心 dHash 帧差门控：恒脏让 unit/card 任务每 tick 可推进。
+    monkeypatch.setattr(type(instance), "_change_dirty", _AlwaysDirty(),
+                        raising=False)
     return instance
+
+
+class _AlwaysDirty:
+    """读恒 True、写忽略的描述符，绕过 change 任务的 dHash 门控。"""
+
+    def __get__(self, obj, objtype=None):
+        return True
+
+    def __set__(self, obj, value):
+        pass
 
 
 # --------------------------------------------------------------- P0-3 snapshots
@@ -96,14 +102,8 @@ def test_untrusted_snapshot_is_latest_but_never_detector_previous(
 ) -> None:
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "dry_run": True, "chatter_interval_seconds": 0}
-    plugin.classifier = FakeClassifier(SCENE_MATCH, True)
-    plugin.hud = FakeHud([
-        {"my_hq": 20, "enemy_hq": 20},
-        {"my_hq": 20, "enemy_hq": 20},
-        {"my_hq": 20, "enemy_hq": 20},
-    ])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier(SCENE_MATCH, True)
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [
             capture_result(1, (0, 0, 0)),
@@ -147,13 +147,8 @@ def test_untrusted_snapshot_is_latest_but_never_detector_previous(
 def test_pause_resume_first_frame_rebases_without_gap_event_storm(plugin: Any) -> None:
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
-    plugin.classifier = FakeClassifier(SCENE_MATCH, True)
-    plugin.hud = FakeHud([
-        {"my_hq": 20, "enemy_hq": 20},
-        {"my_hq": 9, "enemy_hq": 20},  # 11 damage accumulated during the pause
-    ])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier(SCENE_MATCH, True)
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(1, (0, 0, 0)), None, capture_result(3, (255, 255, 255))],
         [trusted_health(1), blocked_health(), trusted_health(3)],
@@ -165,12 +160,13 @@ def test_pause_resume_first_frame_rebases_without_gap_event_storm(plugin: Any) -
 
     plugin._perceive_once()  # untrusted: pause, no baseline update
     assert plugin._capture_pause_active is True
-    plugin._perceive_once()  # resume: rebase instead of HQ/turn/unit diffs
+    plugin._perceive_once()  # resume: rebase instead of unit/turn diffs
 
     assert [record["kind"] for record in plugin._events_log] == [E_MATCH_START]
     assert plugin.tracker.in_match
     assert plugin.tracker.current is not None
-    assert plugin.tracker.current.my_hq == 9
+    # HUD 数字链路已移除：my_hq 恒 None，恢复帧不再产生跨暂停的掉血 diff。
+    assert plugin.tracker.current.my_hq is None
     assert any(entry["stage"] == "capture" and entry["outcome"] == "resumed"
                for entry in plugin.timeline.recent(20))
 
@@ -184,21 +180,16 @@ def test_pause_resume_through_menu_still_rebases_on_return_to_match(
             self.calls: list[Any] = []
             self.scene = self._scenes[0]
 
-        def classify(self, image: Any) -> tuple[str, bool]:
-            self.calls.append(image)
+        def classify(self, detections: Any) -> tuple[str, bool]:
+            self.calls.append(detections)
             self.scene = self._scenes.pop(0)
             return self.scene, self.scene == SCENE_MATCH
 
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
-    plugin.classifier = SequenceClassifier(
+    plugin.screen_classifier = SequenceClassifier(
         [SCENE_MATCH, SCENE_MENU, SCENE_MATCH])
-    plugin.hud = FakeHud([
-        {"my_hq": 20, "enemy_hq": 20},
-        {"my_hq": 9, "enemy_hq": 20},
-    ])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [
             capture_result(1, (0, 0, 0)),
@@ -217,7 +208,7 @@ def test_pause_resume_through_menu_still_rebases_on_return_to_match(
     plugin._perceive_once()  # match baseline/start
     plugin._perceive_once()  # pause
     plugin._perceive_once()  # menu: still a resume baseline
-    plugin._perceive_once()  # back to match with 11 damage accumulated
+    plugin._perceive_once()  # back to match without a gap event storm
 
     assert [record["kind"] for record in plugin._events_log] == [E_MATCH_START]
     assert plugin.tracker.in_match
@@ -230,13 +221,8 @@ def test_every_trusted_tick_drains_even_without_candidates(
 ) -> None:
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
-    plugin.classifier = FakeClassifier(SCENE_MATCH, True)
-    plugin.hud = FakeHud([
-        {"my_hq": 20, "enemy_hq": 20},
-        {"my_hq": 20, "enemy_hq": 20},
-    ])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier(SCENE_MATCH, True)
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(1, (0, 0, 0)), capture_result(2, (0, 0, 0))],
         [trusted_health(1), trusted_health(2)],
@@ -259,13 +245,8 @@ def test_dry_run_simulates_every_tick_without_host_push(
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "dry_run": True, "chatter_interval_seconds": 0}
     plugin._apply_config({"kards": plugin._cfg})
-    plugin.classifier = FakeClassifier(SCENE_MATCH, True)
-    plugin.hud = FakeHud([
-        {"my_hq": 20, "enemy_hq": 20},
-        {"my_hq": 20, "enemy_hq": 20},
-    ])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier(SCENE_MATCH, True)
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(1, (0, 0, 0)), capture_result(2, (0, 0, 0))],
         [trusted_health(1), trusted_health(2)],
@@ -291,12 +272,10 @@ def test_dry_run_simulates_every_tick_without_host_push(
 def test_stop_clears_dispatcher_arbiter_tracker_hud_snapshots(plugin: Any) -> None:
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333}
-    plugin.classifier = FakeClassifier(SCENE_MATCH, True)
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}])
+    plugin.screen_classifier = FakeClassifier(SCENE_MATCH, True)
+    plugin.ui_detector = FakeUiDetector()
     capture = StoppableCapture([], [blocked_health()])
     plugin._capture = capture
-    plugin._hud_cache = {"my_hq": 20, "enemy_hq": 20}
-    plugin._hud_hash = 12345
 
     plugin.tracker.update(MatchState(
         scene=SCENE_MATCH, in_match=True, my_hq=20, enemy_hq=20))
@@ -313,7 +292,7 @@ def test_stop_clears_dispatcher_arbiter_tracker_hud_snapshots(plugin: Any) -> No
     assert plugin.dispatcher.pending == 1
     old_epoch = plugin._epoch
     pushes_before = len(plugin.pushes)
-    classifier_calls = len(plugin.classifier.calls)
+    classifier_calls = len(plugin.screen_classifier.calls)
 
     asyncio.run(plugin.monitor_stop())
 
@@ -323,52 +302,37 @@ def test_stop_clears_dispatcher_arbiter_tracker_hud_snapshots(plugin: Any) -> No
     assert plugin.dispatcher.pending == 0
     assert plugin._previous_snapshot is None
     assert plugin._last_trusted_snapshot is None
-    assert plugin._hud_cache == {}
-    assert plugin._hud_hash is None
     assert plugin.tracker.in_match is False
     assert plugin.tracker.game_number == 0
     assert plugin._current_health().status == "stopped"
     assert plugin.arbiter.decide(
         marked, MatchState(), now=time.time() + 1).allowed
 
-    # A tick holding the pre-stop capture/epoch must abort before OCR or push.
+    # A tick holding the pre-stop capture/epoch must abort before detection
+    # or push.
     plugin._capture = capture
     plugin._perceive_once(old_epoch)
-    assert len(plugin.classifier.calls) == classifier_calls
+    assert len(plugin.screen_classifier.calls) == classifier_calls
     assert len(plugin.pushes) == pushes_before
     assert plugin.dispatcher.pending == 0
 
 
-def test_pause_and_stop_control_local_recording(plugin: Any) -> None:
-    recorder = FakeRecorder()
-    plugin.recorder = recorder
+def test_pause_and_stop_have_no_recording_side_effects(plugin: Any) -> None:
+    # 录像链路已删除：pause/stop 不再触碰任何 recorder 对象。
     plugin._monitoring = True
-    plugin._cfg = {"tick_ms": 333, "recording_enabled": True,
-                   "recording_max_mb": 2048}
-    plugin._apply_config({"kards": plugin._cfg})
-    plugin._session_id = "session-recording"
+    plugin._cfg = {"tick_ms": 333}
+    plugin._session_id = "session-x"
     plugin.tracker.set_session_id(plugin._session_id)
 
-    plugin._start_recording_match(plugin._session_id)
-    plugin._on_capture_frame(frame_stub(11))
-    assert recorder.started and recorder.started[0][0] == plugin._session_id
-    assert recorder.frames == [11]
-    assert plugin._recording_payload()["state"] == "active"
-
     asyncio.run(plugin.monitor_pause())
-    assert recorder.active is False
-    assert plugin._recording_payload()["state"] == "idle"
-
-    # Resume keeps the same in-match recording session; stop cleans it.
     asyncio.run(plugin.monitor_resume())
-    with plugin._lifecycle_lock:
-        plugin._recording_in_match = True
-    plugin._recording_set_active(True, "in_match")
-    plugin._on_capture_frame(frame_stub(12))
-    assert recorder.frames == [11, 12]
     asyncio.run(plugin.monitor_stop())
-    assert recorder.stopped == ["user_stop"]
-    assert plugin._recording_payload()["state"] == "closed"
+
+    assert not hasattr(plugin, "recorder")
+    assert not hasattr(plugin, "_on_capture_frame")
+    recording_stages = [entry for entry in plugin.timeline.recent(30)
+                        if entry["stage"] == "recording"]
+    assert recording_stages == []
     assert plugin._session_id == ""
 
 
@@ -394,9 +358,8 @@ def test_stop_waits_for_inflight_tick_and_stale_tick_cannot_dispatch(
 ) -> None:
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333}
-    plugin.classifier = FakeClassifier(SCENE_MATCH, True)
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}])
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier(SCENE_MATCH, True)
+    plugin.ui_detector = FakeUiDetector()
     started = threading.Event()
     release = threading.Event()
 
@@ -434,7 +397,7 @@ def test_stop_waits_for_inflight_tick_and_stale_tick_cannot_dispatch(
     assert not tick_thread.is_alive()
     assert stop_done.is_set()
     assert plugin._capture is None
-    assert plugin.classifier.calls == [], "stale tick must exit before OCR"
+    assert plugin.screen_classifier.calls == [], "stale tick must exit before detection"
     assert plugin.pushes == []
     assert plugin.dispatcher.pending == 0
 
@@ -455,10 +418,6 @@ def test_start_resets_state_and_restart_uses_a_new_capture(
             self.start_calls += 1
 
     monkeypatch.setattr(MAIN, "ScreenCapture", StartableCapture)
-    plugin._ocr = object()       # skip RapidOCR import in a unit test
-    plugin._detector = object()  # skip ONNX model loading
-    plugin._hud_cache = {"my_hq": 20}
-    plugin._hud_hash = 99
     plugin.tracker.update(MatchState(
         scene=SCENE_MATCH, in_match=True, my_hq=20, enemy_hq=20))
     plugin.dispatcher.submit(
@@ -474,14 +433,14 @@ def test_start_resets_state_and_restart_uses_a_new_capture(
         assert plugin._monitoring is True
         assert plugin._epoch == 1
         assert first is created[-1] and first.start_calls == 1
-        # The producer thread is the sole capture owner and the ring must not
-        # encode JPEG frames in addition to the opt-in recorder.
+        # The producer thread is the sole capture owner; the frame-callback /
+        # JPEG-ring recording chain no longer exists.
         assert first.kwargs["capture_thread_enabled"] is True
-        assert first.kwargs["ring_enabled"] is False
+        assert "on_frame" not in first.kwargs
+        assert "ring_enabled" not in first.kwargs
         assert first.kwargs["fps"] == 20.0
-        assert first.kwargs["on_frame"] == plugin._on_capture_frame
         assert plugin.dispatcher.pending == 0
-        assert plugin._hud_cache == {} and plugin._hud_hash is None
+        assert not hasattr(plugin, "_hud_cache")
         assert plugin.tracker.in_match is False
         assert plugin._previous_snapshot is None
         assert plugin._last_trusted_snapshot is None
@@ -533,10 +492,8 @@ def test_repeated_untrusted_ticks_retry_expire_with_the_same_tick_token(
         plugin: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
-    plugin.classifier = FakeClassifier(SCENE_MATCH, True)
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.screen_classifier = FakeClassifier(SCENE_MATCH, True)
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(1, (0, 0, 0)), None, None],
         [trusted_health(1), blocked_health(), blocked_health()],
@@ -572,22 +529,16 @@ def test_unknown_scene_purges_read_context_without_tracker_diff(
             self.calls: list[Any] = []
             self.scene = self._scenes[0]
 
-        def classify(self, image: Any) -> tuple[str, bool]:
-            self.calls.append(image)
+        def classify(self, detections: Any) -> tuple[str, bool]:
+            self.calls.append(detections)
             self.scene = self._scenes.pop(0)
             return self.scene, self.scene == SCENE_MATCH
 
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
-    plugin.classifier = SequenceClassifier(
+    plugin.screen_classifier = SequenceClassifier(
         [SCENE_MATCH, MAIN.SCENE_UNKNOWN, SCENE_MATCH])
-    plugin.hud = FakeHud([
-        {"my_hq": 20, "enemy_hq": 20},
-        {"my_hq": 20, "enemy_hq": 20},
-        {"my_hq": 20, "enemy_hq": 20},
-    ])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(1, (0, 0, 0)), capture_result(2, (10, 10, 10)),
          capture_result(3, (20, 20, 20))],
@@ -620,7 +571,7 @@ def test_confirmed_menu_exit_resets_match_but_keeps_game_number(
             self._scenes = list(scenes)
             self.scene = self._scenes[0]
 
-        def classify(self, image: Any) -> tuple[str, bool]:
+        def classify(self, detections: Any) -> tuple[str, bool]:
             self.scene = self._scenes.pop(0)
             return self.scene, self.scene == SCENE_MATCH
 
@@ -635,11 +586,9 @@ def test_confirmed_menu_exit_resets_match_but_keeps_game_number(
 
     plugin._monitoring = True
     plugin._cfg = {"tick_ms": 333, "chatter_interval_seconds": 0}
-    plugin.classifier = SequenceClassifier(
+    plugin.screen_classifier = SequenceClassifier(
         [SCENE_MATCH, SCENE_MENU, SCENE_MENU, SCENE_MENU])
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 20}] * 4)
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(i, (i, i, i)) for i in range(1, 5)],
         [trusted_health(i) for i in range(1, 5)],
@@ -664,7 +613,7 @@ def test_terminal_event_is_dispatched_before_current_match_memory_reset(
         def __init__(self, scenes: list[str]) -> None:
             self.scenes = list(scenes)
 
-        def classify(self, image: Any) -> tuple[str, bool]:
+        def classify(self, detections: Any) -> tuple[str, bool]:
             scene = self.scenes.pop(0)
             return scene, scene == SCENE_MATCH
 
@@ -680,10 +629,8 @@ def test_terminal_event_is_dispatched_before_current_match_memory_reset(
                    "battle_output_quiet_window_seconds": 0.0,
                    "battle_output_backpressure_seconds": 0.0}
     plugin._apply_config({"kards": plugin._cfg})
-    plugin.classifier = SceneSequence([SCENE_MATCH, SCENE_VICTORY])
-    plugin.hud = FakeHud([{"my_hq": 20, "enemy_hq": 5}])
-    plugin._hud_read_gated = lambda image, hud: hud.read(image)
-    plugin._detector = None
+    plugin.screen_classifier = SceneSequence([SCENE_MATCH, SCENE_VICTORY])
+    plugin.ui_detector = FakeUiDetector()
     plugin._capture = FakeCapture(
         [capture_result(1, (0, 0, 0)), capture_result(2, (255, 255, 255))],
         [trusted_health(1), trusted_health(2)],

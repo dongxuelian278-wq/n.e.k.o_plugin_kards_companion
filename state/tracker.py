@@ -123,6 +123,11 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+def _explicit_turn(value: Any) -> bool | None:
+    """Only a real bool is turn evidence; anything else stays unknown."""
+    return value if isinstance(value, bool) else None
+
+
 def _unit_last_frame(unit: Any) -> int | None:
     """Frame id of the latest real observation, if the producer supplied one.
 
@@ -266,9 +271,10 @@ class MatchTracker:
         self._hq_candidate: dict[str, int | None] = {SIDE_MINE: None, SIDE_ENEMY: None}
         self._hq_candidate_frames: dict[str, int] = {SIDE_MINE: 0, SIDE_ENEMY: 0}
         self._turn = 0
-        self._confirmed_my_turn = False
+        self._confirmed_my_turn: bool | None = None
         self._turn_pending: bool | None = None
         self._turn_pending_frames = 0
+        self._last_turn_observation_frame: int | None = None
         self._occurrence: dict[tuple[str, str, str], int] = {}
         self._delivered: OrderedDict[str, None] = OrderedDict()
         self._condition_events: dict[tuple[str, str], GameEvent] = {}
@@ -372,9 +378,10 @@ class MatchTracker:
         self._hq_candidate = {SIDE_MINE: None, SIDE_ENEMY: None}
         self._hq_candidate_frames = {SIDE_MINE: 0, SIDE_ENEMY: 0}
         self._turn = 0
-        self._confirmed_my_turn = False
+        self._confirmed_my_turn = None
         self._turn_pending = None
         self._turn_pending_frames = 0
+        self._last_turn_observation_frame = None
         self._occurrence.clear()
         self._delivered.clear()
         self._condition_events.clear()
@@ -405,9 +412,10 @@ class MatchTracker:
         self._hq_candidate = {SIDE_MINE: None, SIDE_ENEMY: None}
         self._hq_candidate_frames = {SIDE_MINE: 0, SIDE_ENEMY: 0}
         self._turn = 0
-        self._confirmed_my_turn = False
+        self._confirmed_my_turn = None
         self._turn_pending = None
         self._turn_pending_frames = 0
+        self._last_turn_observation_frame = None
         self._condition_events.clear()
         self._rebase_pending = False
         self._rebaseline_next_match = False
@@ -595,9 +603,10 @@ class MatchTracker:
             self._sync_band_without_event(side, hp)
         observed_turn = _as_int(state.turn_number)
         self._turn = max(1, observed_turn or 1)
-        self._confirmed_my_turn = bool(state.my_turn)
+        self._confirmed_my_turn = _explicit_turn(state.my_turn)
         self._turn_pending = None
         self._turn_pending_frames = 0
+        self._last_turn_observation_frame = None
         self._condition_events.clear()
         self.match_ledger = {
             "game": self._game_number,
@@ -709,9 +718,11 @@ class MatchTracker:
         elif self._turn <= 0:
             self._turn = max(1, observed_turn or 1)
         # rebase baseline 同步回合态；下一帧不会把暂停前的旧回合当 diff。
-        self._confirmed_my_turn = bool(state.my_turn)
+        # Unknown stays None instead of being inherited as an explicit False.
+        self._confirmed_my_turn = _explicit_turn(state.my_turn)
         self._turn_pending = None
         self._turn_pending_frames = 0
+        self._last_turn_observation_frame = None
         self._prev = state
         self._last_notable_ts = self._now()
         if self._in_match:
@@ -761,15 +772,31 @@ class MatchTracker:
         events.extend(self._order_diff(prev, state, now))
         return events
 
-    def _confirm_turn(self, state: MatchState) -> tuple[bool, bool]:
-        """Two-frame my_turn edge confirmation; returns (committed, value)."""
+    def _confirm_turn(self, state: MatchState) -> tuple[bool, bool | None]:
+        """Independent-observation my_turn edge confirmation.
+
+        Returns ``(committed, confirmed_value)``.  ``None`` is unknown: it
+        neither advances nor resets a pending edge, and it never becomes an
+        explicit False.  A carried tick (``unit_observation_valid=False``) or
+        a repeated detector frame is not independent evidence, so one sampled
+        frame cannot satisfy the two-observation gate by ticking twice.
+        """
         raw = state.my_turn
-        if raw is None:
+        if not isinstance(raw, bool):
             # 缺读/未知不推进边沿，也不回退已确认值。
             self._turn_pending = None
             self._turn_pending_frames = 0
             return False, self._confirmed_my_turn
-        value = bool(raw)
+        if state.unit_observation_valid is False:
+            # Carried state is not a new observation.
+            return False, self._confirmed_my_turn
+        observation_frame = _safe_int(state.unit_observation_frame)
+        if observation_frame is not None and observation_frame > 0:
+            if observation_frame == self._last_turn_observation_frame:
+                return False, self._confirmed_my_turn
+            self._last_turn_observation_frame = observation_frame
+
+        value = raw
         if value == self._confirmed_my_turn:
             self._turn_pending = None
             self._turn_pending_frames = 0
@@ -836,7 +863,6 @@ class MatchTracker:
         events: list[GameEvent] = []
         loss = max(0, old - new)
         new_band = self._band_for(new)
-        label = "我方" if side == SIDE_MINE else "对面"
 
         if loss >= self.hq_damage_threshold:
             if side == SIDE_MINE:
@@ -1066,7 +1092,6 @@ class MatchTracker:
         ``position_history``.  Evidence is bounded to four frame ids and
         contains no images, crops or OCR text.
         """
-        uid = _unit_id(unit)
         first_seen = _safe_int(getattr(unit, "first_seen_frame", None))
         last_seen = _safe_int(getattr(unit, "last_seen_frame", None))
         try:

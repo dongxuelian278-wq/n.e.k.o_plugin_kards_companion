@@ -1,7 +1,6 @@
 import json
 
 import pytest
-
 from kards_companion.knowledge.catalog import (
     CardCatalog,
     CatalogError,

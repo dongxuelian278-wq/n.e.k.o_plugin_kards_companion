@@ -1,20 +1,17 @@
 import json
 
 from kards_companion.perception.detector import (
-    CLASS_TO_ID,
     TRACK_CONFIRM_FRAMES,
     TRACK_HISTORY_LIMIT,
     TRACK_MISS_LIMIT,
     TRACK_MOVE_CONFIRM_FRAMES,
     Detection,
     DetectionFrame,
-    UnitTracker,
     TrackedUnit,
+    UnitTracker,
     assign_rows,
     build_unit_observations,
 )
-from kards_companion.perception.hud_reader import parse_credits, parse_hp
-from kards_companion.perception.screens import ScreenClassifier, _join_text
 from kards_companion.state.model import (
     SCENE_MATCH,
     SIDE_ENEMY,
@@ -24,76 +21,13 @@ from kards_companion.state.model import (
 )
 from kards_companion.state.tracker import MatchTracker
 
-
-def test_parse_credits() -> None:
-    assert parse_credits("12K12") == (12, 12)
-    assert parse_credits("0 K 2") == (0, 2)
-    assert parse_credits("3к5") == (3, 5)  # 西里尔 к 误读
-    assert parse_credits("9K4") is None    # current > cap
-    assert parse_credits("hq 20") is None
-
-
-def test_parse_hp_prefers_continuity() -> None:
-    assert parse_hp("STALINGRAD 27", previous=None) == 27
-    assert parse_hp("18 3", previous=20) == 18      # 与上一读数最近
-    assert parse_hp("88 90", previous=20) == 90     # 超出 6 点连续性 -> 取最大合法值
-    assert parse_hp("no digits") is None
-
-
-def test_join_text_strips_spaces() -> None:
-    ocr = ([[ [[0, 0], [1, 0], [1, 1], [0, 1]], "VICTO RY", 0.9]], None)
-    assert _join_text(ocr) == "victory"
-    assert _join_text(None) == ""
-
-
-class ScriptedOCR(ScreenClassifier):
-    """按裁剪区域尺寸回放预置文本，绕开真 OCR。"""
-
-    def __init__(self, mapping: dict[str, str]) -> None:
-        super().__init__(ocr=None)
-        self._mapping = mapping
-
-    def _run_ocr(self, image) -> str:
-        key = f"{image.width}x{image.height}"
-        for tag, value in self._mapping.items():
-            if key in tag:
-                return value
-        return ""
-
-
-def test_classifier_turn_detection_and_endgames() -> None:
-    from PIL import Image
-    img = Image.new("RGB", (1920, 1080))
-    # 右侧条 (0.84w..w, 0.5h..0.75h) = 308x270 -> 命中结束回合 = match/mine
-    ocr = ScriptedOCR({"308x270": "结束回合"})
-    assert ocr.classify(img) == ("match", True)
-    ocr2 = ScriptedOCR({"1152x670": "胜利 VICTORY"})
-    assert ocr2.classify(img) == ("victory", False)
-    ocr3 = ScriptedOCR({"1152x670": "你战败了"})
-    assert ocr3.classify(img) == ("defeat", False)
-    ocr4 = ScriptedOCR({"1152x670": "收藏 商店 卡组 对战"})
-    assert ocr4.classify(img) == ("menu", False)
-    assert ocr4.scene == "menu"
-
-
-def test_classifier_static_frame_cache() -> None:
-    from PIL import Image
-    calls: list[int] = []
-
-    class CountingOCR(ScreenClassifier):
-        def __init__(self) -> None:
-            super().__init__(ocr=None)
-
-        def _run_ocr(self, image) -> str:
-            calls.append(1)
-            return ""
-
-    ocr = CountingOCR()
-    img = Image.new("RGB", (1920, 1080), (7, 7, 7))
-    ocr.classify(img)
-    n1 = len(calls)
-    ocr.classify(img)  # 完全相同帧 -> 缓存命中
-    assert len(calls) == n1
+# 类别表不再内嵌于 detector：与 knowledge/ui_classes.json v1（10 类）保持一致。
+UI_CLASS_NAMES = (
+    "unit_board", "card_hand", "card_back", "played_card", "hq",
+    "frontline", "end_turn_button", "end_turn_button_active",
+    "screen_victory", "screen_defeat",
+)
+CLASS_TO_ID = {name: index for index, name in enumerate(UI_CLASS_NAMES)}
 
 
 # --------------------------------------------------------------- trajectory

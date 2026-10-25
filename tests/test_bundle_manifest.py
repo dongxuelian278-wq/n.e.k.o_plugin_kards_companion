@@ -49,19 +49,17 @@ def _write(root, rel, data):
     return path
 
 
-def fake_bundle(root, *, kards_det=False):
+def fake_bundle(root, *, models=False):
     _write(root, "plugin.toml", PLUGIN_TOML)
     _write(root, "worker/entry.py", "print('worker')\n")
     _write(root, "worker/lib/util.py", "VALUE = 1\n")
     _write(root, "vendor/numpy/__init__.py", "VERSION = 'fake'\n")
     _write(root, "assets/manifest.json", '{"schema": "test", "assets": []}\n')
     _write(root, "assets/cards/0001.png", b"\x89PNG\r\n\x1a\nfake")
-    _write(root, "ocr_models/runtime.json", '{"runtime": "fake-ocr"}\n')
-    _write(root, "ocr_models/det.onnx", b"fake-onnx")
-    _write(root, "models/manifest.json", '{"kards_det": "optional"}\n')
     _write(root, "THIRD_PARTY_NOTICES.md", "fake notices for tests only\n")
-    if kards_det:
-        _write(root, "models/kards_det.onnx", b"fake-det")
+    if models:
+        _write(root, "models/ui_det.onnx", b"fake-ui-det")
+        _write(root, "models/card_cls.onnx", b"fake-card-cls")
     return root
 
 
@@ -83,17 +81,20 @@ def test_generate_and_verify_complete_bundle(tmp_path):
     assert by_path["vendor/numpy/__init__.py"]["license"] == "LicenseRef-Test-Only"
     assert by_path["THIRD_PARTY_NOTICES.md"]["component"] == "notices"
     assert manifest["required"]["python_worker"]["present"] is True
-    assert manifest["required"]["ocr_runtime"]["present"] is True
     assert manifest["required"]["assets_manifest"]["present"] is True
     assert manifest["required"]["third_party_notices"]["present"] is True
-    assert manifest["optional"]["kards_det"]["state"] == "missing"
-    assert manifest["optional"]["kards_det"]["blocks_ocr"] is False
-    assert manifest["capabilities"]["ocr_bundle_ready"] is True
+    assert "ocr_runtime" not in manifest["required"]
+    assert manifest["optional"]["kards_ui_det"]["state"] == "missing"
+    assert manifest["optional"]["kards_card_cls"]["state"] == "missing"
+    assert manifest["capabilities"]["bundle_ready"] is True
+    assert manifest["capabilities"]["kards_ui_det"] == "missing"
+    assert manifest["capabilities"]["kards_card_cls"] == "missing"
     assert manifest["integrity"]["file_count"] == len(manifest["files"])
     report = bundle.verify_manifest(root, manifest)
     assert report["ok"] is True, report["errors"]
-    assert report["capabilities"]["ocr_bundle_ready"] is True
-    assert "optional_missing:kards_det" in report["warnings"]
+    assert report["capabilities"]["bundle_ready"] is True
+    assert "optional_missing:kards_ui_det" in report["warnings"]
+    assert "optional_missing:kards_card_cls" in report["warnings"]
     assert "license_unverified:worker" in report["warnings"]
 
 
@@ -117,30 +118,34 @@ def test_verify_detects_missing_and_unlisted_files(tmp_path):
     assert "unlisted_file:worker/extra.py" in report["errors"]
 
 
-def test_optional_kards_det_never_blocks_ocr_bundle(tmp_path):
+def test_optional_models_never_block_bundle(tmp_path):
     root = fake_bundle(tmp_path / "bundle")
     manifest = make_manifest(root)
-    assert manifest["optional"]["kards_det"]["state"] == "missing"
+    assert manifest["optional"]["kards_ui_det"]["state"] == "missing"
+    assert manifest["optional"]["kards_card_cls"]["state"] == "missing"
 
-    _write(root, "models/kards_det.onnx", b"fake-det")
+    _write(root, "models/ui_det.onnx", b"fake-ui-det")
+    _write(root, "models/card_cls.onnx", b"fake-card-cls")
     report = bundle.verify_manifest(root, manifest)
     assert report["ok"] is True, report["errors"]
-    assert report["optional"]["kards_det"]["state"] == "present"
-    assert "optional_unlisted:kards_det" in report["warnings"]
+    assert report["optional"]["kards_ui_det"]["state"] == "present"
+    assert "optional_unlisted:models/ui_det.onnx" in report["warnings"]
 
-    manifest_with_det = make_manifest(root)
-    assert manifest_with_det["optional"]["kards_det"]["state"] == "present"
-    (root / "models/kards_det.onnx").unlink()
-    report = bundle.verify_manifest(root, manifest_with_det)
+    manifest_with_models = make_manifest(root)
+    assert manifest_with_models["optional"]["kards_ui_det"]["state"] == "present"
+    assert manifest_with_models["optional"]["kards_card_cls"]["state"] == "present"
+    (root / "models/ui_det.onnx").unlink()
+    (root / "models/card_cls.onnx").unlink()
+    report = bundle.verify_manifest(root, manifest_with_models)
     assert report["ok"] is True, report["errors"]
-    assert report["optional"]["kards_det"]["state"] == "missing"
-    assert "optional_missing:kards_det" in report["warnings"]
-    assert report["capabilities"]["ocr_bundle_ready"] is True
+    assert report["optional"]["kards_ui_det"]["state"] == "missing"
+    assert "optional_missing:kards_ui_det" in report["warnings"]
+    assert report["capabilities"]["bundle_ready"] is True
+    assert "ocr_bundle_ready" not in report["capabilities"]
 
 
 @pytest.mark.parametrize("rel,name", [
     ("worker/entry.py", "python_worker"),
-    ("ocr_models/runtime.json", "ocr_runtime"),
     ("assets/manifest.json", "assets_manifest"),
     ("THIRD_PARTY_NOTICES.md", "third_party_notices"),
 ])
@@ -181,13 +186,12 @@ def test_assets_cards_manifest_satisfies_assets_marker(tmp_path):
     assert report["ok"] is True, report["errors"]
 
 
-def test_worker_ocr_runtime_marker_is_supported(tmp_path):
+def test_ocr_runtime_marker_is_no_longer_required(tmp_path):
+    # OCR 运行时标记已随 OCR 链路删除：不存在 ocr_models 时 bundle 仍 ok。
     root = fake_bundle(tmp_path / "bundle")
-    (root / "ocr_models/runtime.json").unlink()
-    _write(root, "worker/models/ocr/runtime.json", '{"runtime": "fake-ocr"}\n')
     manifest = make_manifest(root)
-    assert manifest["required"]["ocr_runtime"]["path"] == "worker/models/ocr/runtime.json"
-    assert manifest["required"]["ocr_runtime"]["present"] is True
+    assert "ocr_runtime" not in manifest["required"]
+    assert not (root / "ocr_models").exists()
     report = bundle.verify_manifest(root, manifest)
     assert report["ok"] is True, report["errors"]
 
@@ -202,7 +206,6 @@ def test_required_marker_must_not_be_empty(tmp_path):
 
 
 @pytest.mark.parametrize("rel,name", [
-    ("ocr_models/runtime.json", "ocr_runtime"),
     ("assets/manifest.json", "assets_manifest"),
 ])
 @pytest.mark.parametrize("payload", [b"not json", b"[]"])
@@ -491,24 +494,27 @@ def test_sync_bundle_input_missing_manifest_is_fail_closed(tmp_path):
     assert any("manifest_unreadable" in reason for reason in errors), errors
 
 
-def test_sync_bundle_input_skips_missing_optional_kards_det(tmp_path):
-    root = fake_bundle(tmp_path / "bundle", kards_det=True)
+def test_sync_bundle_input_skips_missing_optional_models(tmp_path):
+    root = fake_bundle(tmp_path / "bundle", models=True)
     manifest = make_manifest(root)
     bundle.write_manifest(root / "bundle-manifest.json", manifest)
-    (root / "models/kards_det.onnx").unlink()
+    (root / "models/ui_det.onnx").unlink()
+    (root / "models/card_cls.onnx").unlink()
     _, summary, files, errors = sync.bundle_input(root, True)
     assert summary["ok"] is True, errors
     assert not errors
-    assert "models/kards_det.onnx" not in files
-    assert summary["optional"]["kards_det"]["state"] == "missing"
+    assert "models/ui_det.onnx" not in files
+    assert summary["optional"]["kards_ui_det"]["state"] == "missing"
+    assert summary["optional"]["kards_card_cls"]["state"] == "missing"
 
 
 def test_should_backup_includes_bundle_paths_even_under_models():
-    det = {"models/kards_det.onnx"}
-    assert sync.should_backup("models/kards_det.onnx", det) is True
-    assert sync.should_backup("models/kards_det.onnx", set()) is False
+    det = {"models/ui_det.onnx"}
+    assert sync.should_backup("models/ui_det.onnx", det) is True
+    # models/ 已不再被全局 SKIP：是否进入同步集由 manifest 声明决定。
     assert sync.should_backup("worker/entry.py", set()) is True
     assert sync.should_backup("data/events.jsonl", set()) is False
+    assert sync.should_backup("dataset/x.bin", set()) is False
 
 
 def test_backup_preflight_is_stat_only_and_reports_space(tmp_path):

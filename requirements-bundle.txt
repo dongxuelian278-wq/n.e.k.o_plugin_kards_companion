@@ -28,14 +28,14 @@
 #   - Pillow
 #   - opencv-python-headless          (optional, module name: cv2)
 #   - onnxruntime                     (optional, CPU provider)
-#   - rapidocr-onnxruntime            (optional; newer releases may use "rapidocr")
+#
+# OCR 引擎依赖已随 OCR 全链路移除，不再是候选依赖。
 #
 # Optional capability mapping for the phase-1 self-check:
 #   numpy          -> numeric
 #   Pillow         -> image
 #   cv2            -> vision
 #   onnxruntime    -> detector
-#   rapidocr       -> ocr
 #
 # The build must emit a separate generated lock (for example
 # requirements-bundle.lock.txt) and must refuse to publish if this template is

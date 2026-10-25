@@ -19,7 +19,6 @@ import os
 import threading
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
 from plugin.sdk.plugin import (
@@ -34,94 +33,18 @@ from plugin.sdk.plugin import (
     ui,
 )
 
-try:
-    # The host message hook is registered only when the SDK exposes it (see
-    # neko_wows ``@message(id="chat_quiet_window", source="chat")``).  The
-    # fallback keeps the package importable under test stubs without pretending
-    # the hook is active.
-    from plugin.sdk.plugin import message as _host_message
-except ImportError:  # pragma: no cover - exercised by the stub SDK
-    _host_message = None
-
-
-def _message_hook(**kwargs):
-    if _host_message is not None:
-        return _host_message(**kwargs)
-
-    def decorate(func):
-        return func
-
-    return decorate
-
-
-try:
-    from plugin.sdk.plugin import PluginSettings, SettingsField
-
-    class KardsSettings(PluginSettings):
-        model_config = {"toml_section": "kards"}
-        mode: str = SettingsField("companion", hot=True, enum=["companion", "coach", "silent"],
-                                  description="陪伴 / 教练 / 静默")
-        dry_run: bool = SettingsField(False, hot=True, description="只记录事件到 events.jsonl，不推送")
-        auto_start_monitoring: bool = SettingsField(
-            True, hot=True, description="启动后自动开始监控（旧习惯默认开启）")
-        llm_data_consent: bool = SettingsField(
-            True, hot=True, description="允许把结构化局势交给宿主 LLM 生成解说")
-        chatter_interval_seconds: float = SettingsField(60.0, hot=True, ge=0, le=600,
-                                                        description="平稳期主动点评间隔（0=关）")
-        cooldown_seconds: float = SettingsField(25.0, hot=True, ge=1, le=300, description="普通事件冷却")
-        critical_cooldown_seconds: float = SettingsField(5.0, hot=True, ge=1, le=300, description="紧急事件冷却")
-        min_priority: int = SettingsField(4, hot=True, ge=1, le=9, description="解说优先级门槛")
-        do_not_disturb: bool = SettingsField(False, hot=True, description="免打扰")
-        perf_mode: str = SettingsField("realtime", hot=True, enum=["realtime", "power_saver"],
-                                       description="实时优先 / 省电")
-        tick_ms: float = SettingsField(
-            333.0, hot=True, ge=150, le=5000,
-            description="主循环上限；实际采样由预设/四项 FPS 决定")
-        perception_preset: str = SettingsField(
-            "balanced", hot=True, enum=["low_cost", "balanced", "quality", "custom"],
-            description="采样预设：低负载 / 平衡 / 质量 / 自定义")
-        capture_fps: float = SettingsField(20.0, hot=True, ge=1, le=30, description="采集帧率")
-        change_fps: float = SettingsField(10.0, hot=True, ge=0.5, le=15, description="画面变化检测帧率")
-        hud_fps: float = SettingsField(4.0, hot=True, ge=0.5, le=6, description="HUD OCR 帧率")
-        unit_fps: float = SettingsField(8.0, hot=True, ge=0.5, le=12, description="单位跟踪帧率")
-        capture_fps_power_saver: float = SettingsField(
-            4.0, hot=True, ge=0.5, le=30, description="旧版省电采集帧率（兼容保留）")
-        roi_auto_calibrate: bool = SettingsField(
-            True, hot=True, description="客户区 ROI 自动校准")
-        recording_enabled: bool = SettingsField(
-            False, hot=True, description="局内临时帧录制（默认关；不会发给 LLM）")
-        recording_max_mb: int = SettingsField(
-            2048, hot=True, ge=64, le=65536,
-            description="临时帧滚动上限 MiB（64..65536，含 manifest）")
-        catalog_enabled: bool = SettingsField(False, hot=True, description="卡牌库联网更新（离线加载始终可用）")
-        catalog_url: str = SettingsField("", hot=True, description="卡牌数据源 URL（空=内置候选）")
-        catalog_refresh_hours: float = SettingsField(24.0, hot=True, ge=1, le=720)
-        vlm_enabled: bool = SettingsField(False, hot=True, description="VLM 兜底（密钥仅环境变量）")
-        target_lanlan: str = SettingsField(
-            "", hot=True, description="目标猫娘；空=跟随当前角色（绝不伪造角色名）")
-        plugin_owned_output_enabled: bool = SettingsField(
-            False, hot=True, description="允许插件自有输出；默认由宿主 LLM 生成短回复")
-        user_chat_quiet_window_seconds: float = SettingsField(
-            60.0, hot=True, ge=0, le=600, description="用户聊天后的普通播报安静窗")
-        battle_output_quiet_window_seconds: float = SettingsField(
-            30.0, hot=True, ge=0, le=600, description="普通战斗播报安静窗")
-        battle_output_backpressure_seconds: float = SettingsField(
-            20.0, hot=True, ge=0, le=600, description="普通播报背压窗")
-        reply_max_chars: int = SettingsField(
-            28, hot=True, ge=1, le=200, description="短 TTS 台词字数上限")
-        battle_event_ttl_seconds: float = SettingsField(
-            12.0, hot=True, ge=0, le=120, description="战斗事件最大年龄（秒）")
-        imported_deck_code: str = SettingsField("", hot=True, description="已导入卡组代码")
-except ImportError:  # 老 SDK 无声明式热设置，退化为 config.dump 快照
-    KardsSettings = None  # type: ignore[assignment]
-    SettingsField = None  # type: ignore[assignment]
-
 from .adapters.target import clean_target_lanlan, resolve_target_lanlan
 from .delivery.arbiter import ArbiterConfig, CommentaryArbiter
 from .delivery.contracts import (
-    STATUS_ACCEPTED,
-    STATUS_LEGACY_UNCONFIRMED,
-    STATUS_UNKNOWN,
+    STATUS_ACCEPTED as STATUS_ACCEPTED,
+)
+from .delivery.contracts import (
+    STATUS_LEGACY_UNCONFIRMED as STATUS_LEGACY_UNCONFIRMED,
+)
+from .delivery.contracts import (
+    STATUS_UNKNOWN as STATUS_UNKNOWN,
+)
+from .delivery.contracts import (
     GateResult,
     HostPushConfig,
     HostPushGate,
@@ -131,6 +54,29 @@ from .delivery.publisher import (
     build_commentary_prompt,
     build_live_state_text,
 )
+from .knowledge.catalog import CardCatalog, CatalogError
+from .knowledge.deck_code import DeckCodeError, ParsedDeck, parse_deck_code
+from .perception.capture import (
+    ScreenCapture,
+    dhash,
+    hamming,
+)
+from .perception.detector import UnitTracker
+from .perception.models import (
+    CARD_CLS_PATH,
+    UI_DET_PATH,
+    CardClassifier,
+    UiDetector,
+    load_trusted_card_count,
+)
+from .perception.scheduling import (
+    FPS_KEYS,
+    PerceptionScheduler,
+    PerceptionSettings,
+    SettingsValidationError,
+    legacy_config_warnings,
+)
+from .perception.screens import ScreenClassifier
 from .policy.dispatcher import DeliveryDispatcher, DispatcherConfig
 from .policy.safety import (
     OutputSafetyConfig,
@@ -143,29 +89,18 @@ from .runtime.detectors import DetectorRegistry
 from .runtime.health import CaptureHealthSnapshot
 from .runtime.match_adapter import MatchTrackerAdapter
 from .runtime.scenario import KardsScenarioResolver
+from .runtime.situation import (
+    SITUATION_FRESH_MAX_AGE_SECONDS,
+    build_situation,
+    situation_context_text,
+    situation_payload,
+)
 from .runtime.snapshot import FrameMeta, RuntimeSnapshot
 from .runtime.timeline import RuntimeTimeline
-from .knowledge.catalog import CardCatalog, CatalogError
-from .knowledge.deck_code import DeckCodeError, ParsedDeck, parse_deck_code
-from .perception.capture import (
-    ScreenCapture,
-    client_bbox,
-    dhash,
-    hamming,
-    is_kards_process,
-)
-from .perception.detector import UnitTracker, YoloDetector
-from .perception.hud_reader import HudReader
-from .perception.regions import RegionCalibrator
-from .perception.scheduling import (
-    FPS_KEYS,
-    PerceptionScheduler,
-    PerceptionSettings,
-    SettingsValidationError,
-)
-from .perception.screens import ScreenClassifier
-from .runtime.recording import RecordingConfig, TemporaryFrameRecorder
+from .settings import KardsSettings as KardsSettings
+from .settings import _message_hook
 from .state.model import (
+    E_CHATTER,
     E_MATCH_END,
     SCENE_DEFEAT,
     SCENE_MATCH,
@@ -177,15 +112,17 @@ from .state.model import (
 )
 from .state.tracker import MatchTracker
 
-
 PLUGIN_ID = "kards_companion"
-STATUS_SCHEMA_VERSION = "kards_status_v1"
+STATUS_SCHEMA_VERSION = "kards_status_v2"
 _LIVE_STATE_TOOL_NAME = "kards_get_live_state"
-_MODEL_PATH = Path(__file__).resolve().parent / "models" / "kards_det.onnx"
+# 双模型常量：models/ui_det.onnx（界面检测）与 models/card_cls.onnx（卡牌分类）；
+# 旧七类检测权重（kards-det）不再被加载。
+_MODEL_PATH = UI_DET_PATH  # 兼容别名：仅指向新界面检测模型
+_CARD_CLS_MODEL_PATH = CARD_CLS_PATH
 _VALID_SCENES = frozenset({SCENE_MENU, SCENE_MATCH, SCENE_VICTORY, SCENE_DEFEAT})
 
 # A's runtime.scheduling is the single source of truth for preset values and
-# hard caps.  Order is capture / change / HUD / unit.
+# hard caps.  Order is capture / change / unit / card.
 PERCEPTION_FPS_KEYS: tuple[str, ...] = FPS_KEYS
 PERCEPTION_FPS_PRESETS: dict[str, dict[str, float]] = {
     name: dict(zip(PERCEPTION_FPS_KEYS, values))
@@ -202,11 +139,22 @@ PERCEPTION_FPS_MINS: dict[str, float] = {
     if key in PERCEPTION_FPS_KEYS
 }
 PERCEPTION_PRESET_VALUES = frozenset({*PERCEPTION_FPS_PRESETS, "custom"})
-RECORDING_JPEG_QUALITY_DEFAULT = 85  # fixed user decision
-RECORDING_MAX_MB_MIN = 64
-RECORDING_MAX_MB_MAX = 65536
-RECORDING_MAX_MB_DEFAULT = 2048
 PERCEPTION_SETTINGS_ACTION_KEYS = frozenset(PerceptionSettings.CONFIG_KEYS)
+# 卡牌任务：裁图短边小于该像素数直接跳过（过小裁图分类不可信）。
+CARD_CROP_MIN_SIDE = 40
+# A completely static screen must still produce independent UI samples; the
+# heartbeat re-runs UiDetector at most ~1s apart and never reuses a frame id.
+UI_OBSERVATION_HEARTBEAT_SECONDS = 1.0
+# 检测区域 -> 白名单外观键（trusted_cards.json 的 appearance 维度）。
+CARD_APPEARANCE_BY_REGION = {"card_hand": "hand_full", "played_card": "zoom_full"}
+# UI boxes that can support a scene fact; their confidence is the only real
+# scene confidence source (never a fabricated 1.0).
+SCENE_SIGNAL_CLASSES = frozenset({
+    "frontline", "end_turn_button", "end_turn_button_active",
+    "screen_victory", "screen_defeat",
+})
+# 状态面 recognized_cards 的保留上限。
+RECOGNIZED_CARDS_LIMIT = 20
 
 # Config defaults are centralized so the manifest, runtime snapshot and tests
 # cannot drift.  Explicit user values always win; these are only fallbacks.
@@ -225,14 +173,9 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "perception_preset": "balanced",
     "capture_fps": 20.0,
     "change_fps": 10.0,
-    "hud_fps": 4.0,
-    "unit_fps": 8.0,
+    "unit_fps": 4.0,
+    "card_fps": 6.0,
     "capture_fps_power_saver": 4.0,
-    "roi_auto_calibrate": True,
-    "recording_enabled": False,
-    "recording_max_mb": RECORDING_MAX_MB_DEFAULT,
-    "recording_jpeg_quality": RECORDING_JPEG_QUALITY_DEFAULT,
-    "recording_scope": "match",
     "catalog_enabled": False,
     "catalog_url": "",
     "catalog_refresh_hours": 24.0,
@@ -287,11 +230,14 @@ def _tick_seconds(cfg: dict[str, Any]) -> float:
 
 
 def _legacy_perception_aliases(raw: dict[str, Any]) -> dict[str, Any]:
-    """Map provisional/legacy names onto A's canonical scheduling keys."""
+    """Map provisional/legacy names onto A's canonical scheduling keys.
+
+    已移除功能的旧键（hud_fps/ocr_fps/roi_*/recording_*）不映射、不生效；
+    :func:`_log_legacy_config_warnings` 负责把它们记成 warning。
+    """
     mapped = dict(raw)
     aliases = {
         "detect_fps": "change_fps",
-        "ocr_fps": "hud_fps",
         "tracker_fps": "unit_fps",
     }
     for old, new in aliases.items():
@@ -299,17 +245,6 @@ def _legacy_perception_aliases(raw: dict[str, Any]) -> dict[str, Any]:
             mapped[new] = mapped[old]
     if str(mapped.get("perception_preset") or "").strip().lower() == "low":
         mapped["perception_preset"] = "low_cost"
-    if "roi_auto_calibrate" not in mapped:
-        if "auto_calibrate" in mapped:
-            mapped["roi_auto_calibrate"] = mapped["auto_calibrate"]
-        elif str(mapped.get("roi_mode") or "client").strip().lower() == "client":
-            mapped["roi_auto_calibrate"] = True
-    if "recording_max_mb" not in mapped and "recording_max_bytes" in mapped:
-        try:
-            mapped["recording_max_mb"] = int(
-                float(mapped["recording_max_bytes"]) / (1024 * 1024))
-        except (TypeError, ValueError, OverflowError):
-            pass
     return mapped
 
 
@@ -333,14 +268,9 @@ def _perception_read_model(settings: PerceptionSettings,
         "fps": settings.rates,
         "capture_fps": settings.capture_fps,
         "change_fps": settings.change_fps,
-        "hud_fps": settings.hud_fps,
         "unit_fps": settings.unit_fps,
-        "roi_auto_calibrate": settings.roi_auto_calibrate,
+        "card_fps": settings.card_fps,
         "evidence_enabled": settings.evidence_enabled,
-        "recording_enabled": settings.recording_enabled,
-        "recording_max_mb": settings.recording_max_mb,
-        "recording_jpeg_quality": RECORDING_JPEG_QUALITY_DEFAULT,
-        "recording_scope": "match",
     }
 
 
@@ -412,10 +342,6 @@ class KardsCompanionPlugin(NekoPluginBase):
         self.scheduler = PerceptionScheduler(
             self._perception_settings, clock=time.monotonic)
         self._scheduler_lock = threading.Lock()
-        self.region_calibrator = RegionCalibrator(
-            enabled=self._perception_settings.roi_auto_calibrate,
-            clock=time.monotonic)
-        self._region_lock = threading.Lock()
         self._monitoring = False
         self._started_on_loop = False
         self._startup_armed = False
@@ -423,8 +349,12 @@ class KardsCompanionPlugin(NekoPluginBase):
         self._capture: ScreenCapture | None = None
         self._loop_task: asyncio.Task | None = None
         self._catalog_task: asyncio.Task | None = None
-        self._ocr: Any = None
-        self._detector: YoloDetector | None = None
+        # 双模型加载层：文件缺失/契约不符时进入显式 unavailable/rejected 状态。
+        self.ui_detector = UiDetector(_MODEL_PATH)
+        self.card_classifier = CardClassifier(_CARD_CLS_MODEL_PATH)
+        self._ui_detect_status = "ok"
+        self.screen_classifier = ScreenClassifier()
+        self._trusted_card_count = load_trusted_card_count()
         self._unit_tracker = UnitTracker()
         self._unit_lock = threading.Lock()
         self._last_unit_diagnostics: dict[str, Any] = {}
@@ -432,8 +362,6 @@ class KardsCompanionPlugin(NekoPluginBase):
         # lifecycle-guarded counter, used by both the scheduler and evidence.
         self._capture_frame_seq = 0
         self._deck: ParsedDeck | None = None
-        self._hud_cache: dict[str, Any] = {}
-        self._hud_hash: int | None = None
         self._applied_catalog_url: str | None = None
         self._events_log: list[dict[str, Any]] = []
         self._last_detector_diagnostics: list[dict[str, Any]] = []
@@ -446,6 +374,36 @@ class KardsCompanionPlugin(NekoPluginBase):
         self._classification_valid = False
         self._confirmed_exit_handled = False
         self._pending_rearm: list[GameEvent] = []
+
+        # 卡牌任务跨 tick 状态：最近一次 unit 检测的待分类框与消费水位。
+        # _card_lock 保护 pending 队列与 recognized_cards 列表。
+        self._card_lock = threading.Lock()
+        self._card_consumed_frame = 0
+        self._card_pending_frame = 0
+        self._card_pending_at = 0.0
+        self._card_pending_session = ""
+        self._card_pending: list[tuple[str, Any]] = []  # (region, Detection)
+        self._card_image: Any = None
+        self._recognized_cards: list[dict[str, Any]] = []
+        # Latest independent UI-detector sample.  These are source timestamps,
+        # never publication time; a static capture kept being consumed must not
+        # make the situation look freshly observed.
+        self._last_ui_observation_at: float | None = None
+        self._last_ui_observation_mono: float | None = None
+        self._last_ui_frame_id = 0
+        self._last_ui_signals: list[str] = []
+        self._last_ui_scene_confidence: float | None = None
+        self._ui_observation_failed = False
+        self._ui_rebase_pending = False
+        # Read-context entry idempotence (session + gate token + fingerprint).
+        self._read_context_entered_session = ""
+        self._read_context_entered_token = ""
+        self._read_context_entered_fingerprint = ""
+        # change 任务门控：dHash 指纹与“画面已变化待处理”标志。
+        self._change_hash: int | None = None
+        self._change_dirty = True
+        # capture 实测频率：帧计数差 / 墙钟差。
+        self._capture_rate_probe: tuple[float, int] | None = None
 
         # Lifecycle mutex: guards session ownership (capture/tasks/epoch) and
         # the in-memory pipeline state.  It must NEVER be held across a host
@@ -522,22 +480,11 @@ class KardsCompanionPlugin(NekoPluginBase):
         self._pending_persist: list[dict[str, Any]] = []
         self._persisted_match_keys: set[str] = set()
 
-        # Local-only recording never touches host consent or the LLM path.
-        self._recorder_io_lock = threading.Lock()
-        self.recorder = self._make_recorder()
-        self._recording_match_live = False
-        # Scene-scoped gate read by the capture producer thread.  It is only
-        # true for a confirmed in-match frame with recording enabled, so a
-        # paused/menu/unknown frame can never enter the recorder queue.
-        self._recording_in_match = False
-        self._recording_accepting = False
-
-        # Cross-tick canonical state.  HUD/unit work is scheduled independently
+        # Cross-tick canonical state.  Unit/card work is scheduled independently
         # of classification, so a tick that skips one task must carry the last
         # known value forward instead of feeding a false empty board to the
         # tracker.
         self._pipeline_state = MatchState()
-        self._region_signature: Any = None
 
     # ------------------------------------------------------------- identity
 
@@ -614,6 +561,10 @@ class KardsCompanionPlugin(NekoPluginBase):
                                                  minimum=1, maximum=200)
         normalized["target_lanlan"] = clean_target_lanlan(normalized.get("target_lanlan"))
 
+        # OCR/录像时代的旧键只记 warning，不再参与任何生效路径。
+        for warning in legacy_config_warnings(raw):
+            self.logger.warning("legacy config key ignored: {}", warning)
+
         perception_cfg = _legacy_perception_aliases(raw)
         try:
             perception = PerceptionSettings.from_config(perception_cfg)
@@ -623,13 +574,6 @@ class KardsCompanionPlugin(NekoPluginBase):
         normalized["perception_preset"] = perception.preset
         for key in PERCEPTION_FPS_KEYS:
             normalized[key] = float(getattr(perception, key))
-        normalized["roi_auto_calibrate"] = perception.roi_auto_calibrate
-        normalized["recording_enabled"] = perception.recording_enabled
-        normalized["recording_max_mb"] = perception.recording_max_mb
-        # Fixed user decisions: JPEG quality 85, in-match only.  These are not
-        # user-editable and never enter the settings action.
-        normalized["recording_jpeg_quality"] = RECORDING_JPEG_QUALITY_DEFAULT
-        normalized["recording_scope"] = "match"
 
         previous = dict(self._cfg)
         self._cfg = normalized
@@ -640,7 +584,6 @@ class KardsCompanionPlugin(NekoPluginBase):
         except Exception as exc:
             self.logger.warning("perception scheduler update failed: {}: {}",
                                 type(exc).__name__, exc)
-        self._sync_region_calibrator(previous)
 
         self.arbiter.update(ArbiterConfig(
             mode=normalized["mode"],
@@ -688,36 +631,84 @@ class KardsCompanionPlugin(NekoPluginBase):
                 self._capture.fps = _capture_fps(self._cfg)
             except Exception:
                 pass
-        self._refresh_recording_config(previous)
-
         target_changed = previous.get("target_lanlan") != normalized.get("target_lanlan")
-        if target_changed and self._monitoring:
-            self._expire_read_context("target_changed", token=self.gate.get_token())
+        read_keys = ("mode", "llm_data_consent", "dry_run", "target_lanlan",
+                     *PERCEPTION_FPS_KEYS, "perception_preset")
+        read_changed = any(
+            previous.get(key) != normalized.get(key) for key in read_keys)
+        if self._monitoring and (target_changed or read_changed):
+            # Any read-relevant policy/perception change invalidates the local
+            # cursor.  The publisher's gate still decides whether a cleanup
+            # tombstone may actually be pushed (consent=false / dry-run = no
+            # host push), so this never bypasses the hard data policy.
+            self._expire_read_context(
+                "target_changed" if target_changed else "config_changed",
+                token=self.gate.get_token())
 
-    # ------------------------------------------------------- 感知 / 录制设置
+    # ------------------------------------------------------------- 感知设置面
 
-    def _sync_region_calibrator(self, previous: dict[str, Any] | None = None) -> None:
-        enabled = bool(self._perception_settings.roi_auto_calibrate)
-        with self._region_lock:
-            if self.region_calibrator.enabled == enabled:
-                return
-            self.region_calibrator = RegionCalibrator(
-                enabled=enabled, clock=time.monotonic)
-            regions = self.region_calibrator.regions
-        hud = getattr(self, "hud", None)
-        if hud is not None:
-            try:
-                hud.set_regions(regions)
-            except Exception:
-                pass
-        with self._lifecycle_lock:
-            self._hud_hash = None
-            self._hud_cache = {}
-            self._region_signature = None
+    def _measured_fps_payload(self) -> dict[str, Any]:
+        """capture/change/unit/card 实测频率（与目标值并列展示）。"""
+        with self._scheduler_lock:
+            measured = dict(self.scheduler.measured_fps())
+        measured["capture"] = self._measured_capture_fps()
+        return measured
 
-    def _region_snapshot(self) -> dict[str, Any]:
-        with self._region_lock:
-            return self.region_calibrator.snapshot()
+    def _measured_capture_fps(self) -> float | None:
+        """采集实测频率：capture.stats 帧计数差 / 墙钟差。"""
+        capture = self._capture
+        if capture is None:
+            return None
+        now = time.monotonic()
+        try:
+            frames = int(capture.stats.get("frames", 0) or 0)
+        except Exception:
+            return None
+        probe_at, probe_frames = self._capture_rate_probe or (None, None)
+        if probe_at is None:
+            self._capture_rate_probe = (now, frames)
+            return None
+        span = now - probe_at
+        if span < 1.0:
+            return None
+        self._capture_rate_probe = (now, frames)
+        delta = frames - int(probe_frames or 0)
+        if delta <= 0:
+            return None
+        return round(delta / span, 3)
+
+    @staticmethod
+    def _model_status(model: Any, *, role: str) -> dict[str, Any]:
+        """读取模型状态；测试桩/异常实现退化为最小诊断视图。"""
+        try:
+            status = dict(model.status())
+        except Exception:
+            status = {
+                "role": role,
+                "state": "unavailable",
+                "loaded": False,
+                "diagnostics": "status_unavailable",
+            }
+        status.setdefault("role", role)
+        return status
+
+    def _models_payload(self) -> dict[str, Any]:
+        """状态面 models 段：双模型加载态 + 类别表版本 + 可信卡数。"""
+        ui_status = self._model_status(self.ui_detector, role="ui_detect")
+        card_status = self._model_status(self.card_classifier, role="card_classify")
+        return {
+            "ui_det": ui_status,
+            "card_cls": card_status,
+            "class_map_versions": {
+                "ui_classes": ui_status.get("class_map_version"),
+                "card_classes": card_status.get("class_map_version"),
+            },
+            "trusted_card_count": int(self._trusted_card_count),
+        }
+
+    def _recognized_cards_payload(self) -> list[dict[str, Any]]:
+        with self._card_lock:
+            return [dict(item) for item in self._recognized_cards[-RECOGNIZED_CARDS_LIMIT:]]
 
     def _perception_settings_payload(self) -> dict[str, Any]:
         settings = self._perception_settings
@@ -742,257 +733,9 @@ class KardsCompanionPlugin(NekoPluginBase):
             "scheduler": {
                 "settings": settings.to_dict(),
                 "tasks": tasks,
+                "measured_fps": self._measured_fps_payload(),
             },
-            "regions": self._region_snapshot(),
         }
-
-    def _recording_config(self) -> RecordingConfig:
-        settings = self._perception_settings
-        return RecordingConfig(
-            enabled=bool(settings.recording_enabled),
-            max_bytes=int(settings.recording_max_mb) * 1024 * 1024,
-            jpeg_quality=RECORDING_JPEG_QUALITY_DEFAULT,
-        )
-
-    def _make_recorder(self) -> TemporaryFrameRecorder | None:
-        try:
-            recorder = TemporaryFrameRecorder(
-                Path(self.data_path("recording")),
-                config=self._recording_config(),
-                clock=time.time,
-                logger=self.logger,
-            )
-        except Exception as exc:
-            self.logger.warning("recording recorder init failed: {}: {}",
-                                type(exc).__name__, exc)
-            return None
-        return recorder
-
-    def _recording_payload(self) -> dict[str, Any]:
-        settings = self._perception_settings
-        recorder = getattr(self, "recorder", None)
-        raw: dict[str, Any] = {}
-        if recorder is not None:
-            try:
-                raw = recorder.snapshot()
-            except Exception as exc:
-                self.logger.warning("recording snapshot failed: {}: {}",
-                                    type(exc).__name__, exc)
-                raw = {"state": "error", "error": type(exc).__name__}
-        raw_state = str(raw.get("state") or "")
-        state = {
-            "recording": "active",
-            "paused": "paused",
-            "idle": "idle",
-            "stopped": "closed",
-            "disabled": "off",
-        }.get(raw_state, "unknown")
-        if not settings.recording_enabled:
-            state = "off"
-        elif recorder is None:
-            state = "unavailable"
-        max_bytes = _integer(
-            raw.get("max_bytes"),
-            int(settings.recording_max_mb) * 1024 * 1024, minimum=0)
-        return {
-            "enabled": bool(settings.recording_enabled),
-            "available": recorder is not None,
-            "active": bool(raw.get("active")) and state == "active",
-            "state": state,
-            "raw_state": raw_state,
-            "reason": str(raw.get("reason") or ""),
-            "scope": "match",
-            "jpeg_quality": RECORDING_JPEG_QUALITY_DEFAULT,
-            "full_resolution": True,
-            "local_only": True,
-            "max_bytes": int(max_bytes),
-            "bytes": _integer(raw.get("bytes"), 0, minimum=0),
-            "frame_count": _integer(
-                raw.get("written", raw.get("files", 0)), 0, minimum=0),
-            "captured": _integer(raw.get("captured"), 0, minimum=0),
-            "files": _integer(raw.get("files"), 0, minimum=0),
-            "dropped": _integer(raw.get("dropped"), 0, minimum=0),
-            "pending": _integer(raw.get("pending"), 0, minimum=0),
-            "clean": bool(raw.get("clean", not raw.get("error"))),
-            "error": str(raw.get("error") or ""),
-        }
-
-    def _refresh_recording_config(self, previous: dict[str, Any] | None = None) -> None:
-        recorder = getattr(self, "recorder", None)
-        if recorder is not None:
-            try:
-                with self._recorder_io_lock:
-                    recorder.update_config(self._recording_config())
-            except Exception as exc:
-                self.logger.warning("recording config update failed: {}: {}",
-                                    type(exc).__name__, exc)
-        enabled = bool(self._perception_settings.recording_enabled)
-        with self._lifecycle_lock:
-            if not enabled:
-                self._recording_accepting = False
-            else:
-                self._recording_accepting = bool(
-                    self._recording_match_live and self._recording_in_match
-                    and self._monitoring and not self._user_paused)
-
-    def _recording_set_active(self, active: bool, reason: str) -> None:
-        recorder = getattr(self, "recorder", None)
-        active = bool(active)
-        with self._lifecycle_lock:
-            self._recording_accepting = bool(
-                active and self._perception_settings.recording_enabled
-                and self._recording_match_live
-                and self._recording_in_match and self._monitoring
-                and not self._user_paused)
-        if recorder is None:
-            return
-        try:
-            with self._recorder_io_lock:
-                recorder.set_active(active, reason)
-        except Exception as exc:
-            self.logger.warning("recording set_active failed: {}: {}",
-                                type(exc).__name__, exc)
-
-    def _start_recording_match(self, session_id: str) -> None:
-        recorder = getattr(self, "recorder", None)
-        if recorder is None or not self._perception_settings.recording_enabled:
-            return
-        with self._lifecycle_lock:
-            if not self._monitoring or self._user_paused:
-                return
-            match_id = int(self.tracker.game_number or 0)
-        try:
-            with self._recorder_io_lock:
-                recorder.start_match(session_id, match_id)
-                recorder.set_active(True, "in_match")
-        except Exception as exc:
-            self.logger.warning("recording start_match failed: {}: {}",
-                                type(exc).__name__, exc)
-            return
-        with self._lifecycle_lock:
-            self._recording_match_live = True
-            self._recording_in_match = True
-            self._recording_accepting = bool(
-                self._perception_settings.recording_enabled
-                and not self._user_paused)
-        self.timeline.record(
-            "recording", "started", ts=time.time(),
-            detail={"session_id": str(session_id or ""),
-                    "match_id": int(match_id),
-                    "jpeg_quality": RECORDING_JPEG_QUALITY_DEFAULT,
-                    "scope": "match"})
-
-    def _end_recording_match(self, reason: str) -> None:
-        recorder = getattr(self, "recorder", None)
-        with self._lifecycle_lock:
-            self._recording_match_live = False
-            self._recording_in_match = False
-            self._recording_accepting = False
-        if recorder is None:
-            return
-        before: dict[str, Any] = {}
-        try:
-            with self._recorder_io_lock:
-                before = recorder.snapshot()
-                recorder.end_match(reason)
-        except Exception as exc:
-            self.logger.warning("recording end_match failed: {}: {}",
-                                type(exc).__name__, exc)
-            return
-        self.timeline.record(
-            "recording", "closed", ts=time.time(), reason=str(reason),
-            detail={"bytes": _integer(before.get("bytes"), 0, minimum=0),
-                    "frame_count": _integer(
-                        before.get("written", before.get("files", 0)), 0,
-                        minimum=0),
-                    "clean": bool(before.get("clean", True))})
-
-    def _stop_recording(self, reason: str) -> None:
-        recorder = getattr(self, "recorder", None)
-        with self._lifecycle_lock:
-            self._recording_match_live = False
-            self._recording_in_match = False
-            self._recording_accepting = False
-        if recorder is None:
-            return
-        before: dict[str, Any] = {}
-        try:
-            with self._recorder_io_lock:
-                before = recorder.snapshot()
-                recorder.stop(reason)
-            snapshot = recorder.snapshot()
-        except Exception as exc:
-            self.logger.warning("recording stop failed: {}: {}",
-                                type(exc).__name__, exc)
-            return
-        self.timeline.record(
-            "recording", "stopped", ts=time.time(), reason=str(reason),
-            detail={"bytes": _integer(before.get("bytes"), 0, minimum=0),
-                    "frame_count": _integer(
-                        before.get("written", before.get("files", 0)), 0,
-                        minimum=0),
-                    "clean": bool(snapshot.get("clean", True))})
-        if not bool(snapshot.get("clean", True)):
-            self.timeline.record(
-                "recording", "unclean_stop", ts=time.time(),
-                reason=str(snapshot.get("error") or "pending_cleanup"),
-                detail={"state": str(snapshot.get("state") or "")})
-
-    @staticmethod
-    def _recording_frame_allowed(result: Any) -> bool:
-        """Only a validated KARDS client-area frame may reach the recorder.
-
-        A desktop backend's client bbox is the sole crop source.  An unknown
-        source, missing window identity, non-KARDS process, or a frame whose
-        pixel size differs from that client bbox is refused: a full-desktop
-        frame must never be written.
-        """
-        if result is None:
-            return False
-        if getattr(result, "trusted", False) is not True:
-            return False
-        image = getattr(result, "image", None)
-        window = getattr(result, "window", None)
-        source = str(getattr(result, "source", "")
-                     or getattr(result, "backend", "") or "")
-        if image is None or window is None:
-            return False
-        if source not in {"host_wgc", "dxcam", "imagegrab"}:
-            return False
-        process = str(getattr(window, "process_name", "") or "")
-        if process and not is_kards_process(process):
-            return False
-        bbox = client_bbox(window)
-        if not bbox or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-            return False
-        width = _integer(getattr(result, "width", 0), 0, minimum=0)
-        height = _integer(getattr(result, "height", 0), 0, minimum=0)
-        try:
-            image_size = tuple(int(value) for value in image.size)
-        except Exception:
-            return False
-        if image_size != (width, height):
-            return False
-        return (width, height) == (bbox[2] - bbox[0], bbox[3] - bbox[1])
-
-    def _on_capture_frame(self, result: Any) -> None:
-        """Capture producer callback: never block on encoder or disk I/O.
-
-        ``submit`` copies the pixels and performs a bounded ``put_nowait``;
-        JPEG encoding and rolling deletes happen on the recorder worker.
-        """
-        if not self._recording_accepting:
-            return
-        recorder = getattr(self, "recorder", None)
-        if recorder is None or not self._recording_match_live:
-            return
-        if not self._recording_frame_allowed(result):
-            return
-        try:
-            recorder.submit(result)
-        except Exception as exc:
-            self.logger.warning("recording submit failed: {}: {}",
-                                type(exc).__name__, exc)
 
     async def _reload_config(self) -> None:
         try:
@@ -1005,14 +748,6 @@ class KardsCompanionPlugin(NekoPluginBase):
     @lifecycle(id="startup")
     async def startup(self, **_):
         await self._reload_config()
-        if self.recorder is not None:
-            try:
-                cleanup = await asyncio.to_thread(self.recorder.cleanup_orphans)
-                if cleanup.get("status") not in ("ok", "missing"):
-                    self.logger.warning("recording orphan cleanup: {}", cleanup)
-            except Exception as exc:
-                self.logger.warning("recording orphan cleanup failed: {}: {}",
-                                    type(exc).__name__, exc)
         self._startup_armed = True
         # Never start long-lived tasks on the SDK's transient startup loop.
         self._maybe_schedule_auto_start()
@@ -1144,26 +879,21 @@ class KardsCompanionPlugin(NekoPluginBase):
             return False
         self._expire_read_context("pipeline_start", token=self.gate.get_token())
 
-        if self._ocr is None:
-            try:
-                from rapidocr_onnxruntime import RapidOCR
-                self._ocr = RapidOCR()
-            except Exception as exc:
-                self.logger.warning("RapidOCR unavailable ({}), degrade to capture-only", exc)
-            self.classifier = ScreenClassifier(self._ocr)
-            self.hud = HudReader(self._ocr)
-        if self._detector is None and _MODEL_PATH.is_file():
-            try:
-                self._detector = YoloDetector(str(_MODEL_PATH))
-            except Exception as exc:
-                self.logger.warning("detector load failed: {}: {}", type(exc).__name__, exc)
+        # 双模型惰性重载：推理期异常把状态打成 error 后，下个会话重试加载；
+        # 文件缺失保持 unavailable，等待部署补齐权重。
+        if not self.ui_detector.available and self.ui_detector.state in ("error", "unavailable"):
+            self.ui_detector = UiDetector(_MODEL_PATH)
+        if not self.card_classifier.available and self.card_classifier.state in ("error", "unavailable"):
+            self.card_classifier = CardClassifier(_CARD_CLS_MODEL_PATH)
+        for model in (self.ui_detector, self.card_classifier):
+            if not model.available and model.diagnostics:
+                self.logger.warning("model {} not ready ({}): {}",
+                                    type(model).__name__, model.state, model.diagnostics)
 
         capture = ScreenCapture(
             fps=_capture_fps(self._cfg),
-            on_frame=self._on_capture_frame,
             # The producer thread owns the single capture path; the perception
             # loop consumes latest_capture() and never opens a competing grab.
-            ring_enabled=False,
             capture_thread_enabled=True,
         )
         with self._lifecycle_lock:
@@ -1220,13 +950,6 @@ class KardsCompanionPlugin(NekoPluginBase):
                 except (asyncio.CancelledError, Exception):
                     pass
         await self._wait_for_ticks_idle()
-        # Recording is local-only; stop/clean its current session after
-        # in-flight ticks are done so no late frame can touch the next session.
-        try:
-            await asyncio.to_thread(self._stop_recording, reason)
-        except Exception as exc:
-            self.logger.warning("recording stop failed: {}: {}",
-                                type(exc).__name__, exc)
 
         # 3) Drop queued respond items without touching policy modules.
         self._purge_dispatcher_queue()
@@ -1291,8 +1014,6 @@ class KardsCompanionPlugin(NekoPluginBase):
                 return
             self._user_paused = True
             self._pause_reason = reason
-            self._recording_in_match = False
-            self._recording_accepting = False
         try:
             self.guard.pause(reason, auto=False)
         except Exception:
@@ -1304,11 +1025,6 @@ class KardsCompanionPlugin(NekoPluginBase):
         except Exception as exc:
             self.logger.warning("gate pause failed: {}: {}", type(exc).__name__, exc)
         await self._wait_for_ticks_idle()
-        try:
-            await asyncio.to_thread(self._recording_set_active, False, "user_pause")
-        except Exception as exc:
-            self.logger.warning("recording pause failed: {}: {}",
-                                type(exc).__name__, exc)
         self._purge_dispatcher_queue()
         try:
             pause_token = self.gate.get_token()
@@ -1334,7 +1050,6 @@ class KardsCompanionPlugin(NekoPluginBase):
                 self.tracker.rebase()
                 with self._unit_lock:
                     self._unit_tracker.rebase()
-            recording_live = bool(self._recording_match_live)
         # UI resume is explicit: clear both the manual pause and any automatic
         # failure pause.  There is no automatic half-open leak here.
         for kwargs in ({}, {"auto": True}):
@@ -1346,15 +1061,6 @@ class KardsCompanionPlugin(NekoPluginBase):
             await asyncio.to_thread(self.gate.resume)
         except Exception as exc:
             self.logger.warning("gate resume failed: {}: {}", type(exc).__name__, exc)
-        if recording_live:
-            # Re-open the existing session; the scene gate keeps accepting
-            # false until the next confirmed in-match frame.
-            try:
-                await asyncio.to_thread(
-                    self._recording_set_active, True, "resume")
-            except Exception as exc:
-                self.logger.warning("recording resume failed: {}: {}",
-                                    type(exc).__name__, exc)
         self.timeline.record("pipeline", "resumed", ts=time.time(), reason="user_resume")
 
     async def _catalog_loop(self, epoch: int | None = None) -> None:
@@ -1440,14 +1146,23 @@ class KardsCompanionPlugin(NekoPluginBase):
         return 0
 
     def _expire_read_context(self, reason: str, *, token: str | None = None) -> bool:
-        """Retire the host read context outside the lifecycle lock."""
+        """Retire the host read/context cursor outside the lifecycle lock.
+
+        The delivery owner's ``expire`` restores/clears both the core live-state
+        slot and the context slot.  Main only clears its local enter marker so
+        the next allowed tick re-announces capability boundaries; it must not
+        send a second restore push itself.
+        """
+        with self._lifecycle_lock:
+            self._read_context_entered_token = ""
+            self._read_context_entered_session = ""
+            self._read_context_entered_fingerprint = ""
         expire = getattr(self.publisher, "expire", None)
         if not callable(expire):
             return False
         try:
-            if token is not None and _supports_kwarg(expire, "context_token"):
-                return bool(expire(reason=reason, context_token=token))
-            return bool(expire(reason=reason))
+            # Exact frozen API: expire owns both core and context slots.
+            return bool(expire(reason=reason, context_token=token))
         except Exception as exc:
             self.logger.warning("publisher expire failed: {}: {}", type(exc).__name__, exc)
             return False
@@ -1486,33 +1201,32 @@ class KardsCompanionPlugin(NekoPluginBase):
                     pass
             self._last_unit_diagnostics = {}
         self._pipeline_state = MatchState()
-        self._region_signature = None
-        self._recording_in_match = False
-        self._recording_accepting = False
-        self._hud_cache = {}
-        self._hud_hash = None
-        hud = getattr(self, "hud", None)
-        reset_hud = getattr(hud, "reset", None)
-        if callable(reset_hud):
-            try:
-                reset_hud()
-            except Exception:
-                pass
-        classifier = getattr(self, "classifier", None)
-        invalidate = getattr(classifier, "invalidate", None)
-        if callable(invalidate):
-            try:
-                invalidate()
-            except Exception:
-                pass
+        # 场景分类器回到 unknown 基线；卡牌任务丢弃待分类框与识别缓存。
         try:
-            with self._region_lock:
-                self.region_calibrator.reset()
-                regions = self.region_calibrator.regions
-            if hud is not None:
-                hud.set_regions(regions)
+            self.screen_classifier.invalidate()
         except Exception:
             pass
+        with self._card_lock:
+            self._card_consumed_frame = 0
+            self._card_pending = []
+            self._card_pending_frame = 0
+            self._card_pending_at = 0.0
+            self._card_pending_session = ""
+            self._card_image = None
+            self._recognized_cards = []
+        self._last_ui_observation_at = None
+        self._last_ui_observation_mono = None
+        self._last_ui_frame_id = 0
+        self._last_ui_signals = []
+        self._last_ui_scene_confidence = None
+        self._ui_observation_failed = False
+        self._ui_rebase_pending = False
+        self._read_context_entered_session = ""
+        self._read_context_entered_token = ""
+        self._read_context_entered_fingerprint = ""
+        self._change_hash = None
+        self._change_dirty = True
+        self._capture_rate_probe = None
         self._previous_snapshot = None
         self._last_trusted_snapshot = None
         self._last_detector_diagnostics = []
@@ -1552,11 +1266,12 @@ class KardsCompanionPlugin(NekoPluginBase):
                        token_epoch: int | None = None) -> None:
         """One perception tick.
 
-        Trusted frame: scenario pre-gate → tracker/detector → normalize → one
-        scenario update under the lifecycle lock, then all delivery/read host
-        calls outside the lock with the token captured at tick entry.
+        Trusted frame: change 门控（dHash）→ unit 任务（ui_det 检测 + 场景推断
+        + 单位轨迹）→ card 任务（card_hand/played_card 裁图分类）→ normalize
+        → one scenario update under the lifecycle lock, then all delivery/read
+        host calls outside the lock with the token captured at tick entry.
 
-        Untrusted frame: no classifier/HUD/YOLO/tracker, one scenario pause
+        Untrusted frame: no detector/classifier/tracker, one scenario pause
         update, one delivery purge + read-context expire at the transition.
         """
         if context_token is None:
@@ -1638,10 +1353,6 @@ class KardsCompanionPlugin(NekoPluginBase):
                 first_pause = not self._capture_pause_active
                 self._capture_pause_active = True
                 self._pause_reason = reason
-                # Unknown/minimized/stale frames pause recording but keep the
-                # temporary match session (it is only deleted on match end).
-                self._recording_in_match = False
-                self._recording_accepting = False
                 # One scenario pause update per tick; it never confirms exit
                 # from unknown frames.
                 try:
@@ -1663,7 +1374,6 @@ class KardsCompanionPlugin(NekoPluginBase):
             # purges the respond slot.
             if first_pause:
                 self._purge_dispatcher_queue()
-            self._recording_set_active(False, reason)
             self._expire_read_context(reason, token=context_token)
             return
 
@@ -1700,7 +1410,7 @@ class KardsCompanionPlugin(NekoPluginBase):
                 scene=base.scene,
                 game_number=int(base.game_number or 0),
                 in_match=bool(base.in_match),
-                my_turn=bool(base.my_turn),
+                my_turn=base.my_turn,
                 turn_number=int(base.turn_number or 0),
                 my_hq=base.my_hq,
                 enemy_hq=base.enemy_hq,
@@ -1718,29 +1428,134 @@ class KardsCompanionPlugin(NekoPluginBase):
             # units but is not fresh unit evidence.
             state.unit_observation_valid = False
             state.unit_observation_frame = 0
-            classifier = getattr(self, "classifier", None)
-            hud = getattr(self, "hud", None)
 
+        # ---- change 任务：纯 dHash 帧差门控，不跑任何模型 -------------------
         with self._scheduler_lock:
             change_due = self.scheduler.due("change", frame_id=frame_id)
 
         if change_due:
             started = time.monotonic()
-            if classifier is not None:
-                try:
-                    scene, my_turn = classifier.classify(image)
-                except Exception as exc:
-                    self.logger.warning("scene classify failed: {}: {}",
-                                        type(exc).__name__, exc)
-                    scene, my_turn = SCENE_UNKNOWN, False
-            else:
-                scene, my_turn = SCENE_UNKNOWN, False
-            state.scene = str(scene or SCENE_UNKNOWN)
-            state.my_turn = bool(my_turn) if state.scene == SCENE_MATCH else False
-            state.in_match = state.scene == SCENE_MATCH
+            fingerprint = dhash(image)
+            with self._lifecycle_lock:
+                if (self._change_hash is None
+                        or hamming(fingerprint, self._change_hash) > 2):
+                    self._change_hash = fingerprint
+                    # 画面有变化：允许下一次 unit 任务推进检测/场景。
+                    self._change_dirty = True
             with self._scheduler_lock:
                 self.scheduler.mark_duration(
                     "change", max(0.0, time.monotonic() - started))
+
+        # ---- unit 任务前半：ui_det 检测 → 场景推断（ScreenClassifier） -----
+        # 场景必须先于 pre-gate 得到（与旧 change 任务一致），resume 的
+        # rebase 才能在首个观测被消费前生效。
+        detections: list[Any] | None = None
+        unit_due = False
+        with self._scheduler_lock:
+            unit_fps = max(0.5, float(
+                getattr(self._perception_settings, "unit_fps", 4.0) or 4.0))
+            heartbeat_s = min(UI_OBSERVATION_HEARTBEAT_SECONDS,
+                              max(0.1, 1.0 / unit_fps))
+            heartbeat_due = (
+                self._last_ui_observation_mono is None
+                or time.monotonic() - self._last_ui_observation_mono >= heartbeat_s)
+            if self._change_dirty or heartbeat_due:
+                unit_due = self.scheduler.due("unit", frame_id=frame_id)
+            if (unit_due and not self._change_dirty
+                    and (frame_id == self._last_ui_frame_id
+                         or (self._last_ui_observation_at is not None
+                             and observed_at <= self._last_ui_observation_at))):
+                # A repeated capture frame/timestamp is not a second
+                # independent UI observation; the 2-frame scene/unit gates
+                # must not advance.
+                unit_due = False
+
+        if unit_due:
+            started = time.monotonic()
+            detections = self._detect_ui(image)
+            if detections is not None:
+                self._last_ui_observation_at = observed_at
+                self._last_ui_observation_mono = time.monotonic()
+                self._last_ui_frame_id = int(frame_id)
+                self._last_ui_signals = [
+                    str(getattr(det, "name", "")) for det in detections
+                    if str(getattr(det, "name", ""))]
+                scene_confs: list[float] = []
+                for det in detections:
+                    if str(getattr(det, "name", "")) not in SCENE_SIGNAL_CLASSES:
+                        continue
+                    try:
+                        value = float(getattr(det, "conf", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    if value == value and 0.0 <= value <= 1.0:
+                        scene_confs.append(value)
+                self._last_ui_scene_confidence = (
+                    round(max(scene_confs), 3) if scene_confs else None)
+                self._ui_observation_failed = False
+                if self._ui_rebase_pending:
+                    # A failed UI observation ended the previous continuous
+                    # baseline; the first good sample is a silent baseline.
+                    self.tracker.rebase()
+                    with self._unit_lock:
+                        self._unit_tracker.rebase()
+                    self._ui_rebase_pending = False
+                try:
+                    scene, my_turn = self.screen_classifier.classify(detections)
+                except Exception as exc:
+                    self.logger.warning("scene classify failed: {}: {}",
+                                        type(exc).__name__, exc)
+                    scene, my_turn = SCENE_UNKNOWN, None
+                state.scene = str(scene or SCENE_UNKNOWN)
+                # Keep the classifier's tri-state as-is: unknown stays None,
+                # never a fabricated False.
+                state.my_turn = (my_turn if isinstance(my_turn, bool)
+                                 and state.scene == SCENE_MATCH else None)
+                state.in_match = state.scene == SCENE_MATCH
+                # card 任务消费最近一次 unit 检测的 card_hand/played_card 框。
+                self._stage_card_crops(detections, image, frame_id,
+                                       observed_at=observed_at)
+                # 本帧已跑过检测；画面再次变化前不重复推理。
+                with self._lifecycle_lock:
+                    self._change_dirty = False
+            else:
+                # Model/inference failure is not an empty board.  Let the unit
+                # tracker preserve last-known identities with observed=False
+                # (so diagnostics stay honest), then invalidate the scene so a
+                # stale match cannot keep context_valid/read alive.
+                if state.scene == SCENE_MATCH or self.tracker.in_match:
+                    unit_diagnostics = self._apply_detector(
+                        state, image, None, frame_id=frame_id,
+                        observed_at=observed_at,
+                        observation=self._observation_evidence(
+                            capture, result, health))
+                    state.unit_observation_valid = bool(
+                        (unit_diagnostics or {}).get("observation_valid", False))
+                    state.unit_observation_frame = int(frame_id)
+                self._ui_observation_failed = True
+                self._ui_rebase_pending = True
+                state.scene = SCENE_UNKNOWN
+                state.my_turn = None
+                state.in_match = False
+            with self._scheduler_lock:
+                self.scheduler.mark_duration(
+                    "unit", max(0.0, time.monotonic() - started) / 2.0)
+
+        # Carried (non-UI) ticks may keep the last **verified** scene only while
+        # a real UI sample is within the freshness bound.  A stale/failed UI
+        # observation must not let a copied ``base.scene=match`` keep
+        # scenario.context_valid true on every capture tick.
+        if not (unit_due and detections is not None):
+            with self._lifecycle_lock:
+                ui_at = self._last_ui_observation_at
+                ui_failed = bool(self._ui_observation_failed)
+            ui_stale = (ui_failed or ui_at is None
+                        or max(0.0, observed_at - float(ui_at))
+                        > SITUATION_FRESH_MAX_AGE_SECONDS)
+            if ui_stale:
+                state.scene = SCENE_UNKNOWN
+                state.my_turn = None
+                state.in_match = False
 
         # Pure scene gate runs before the expensive HUD/unit tasks so a resume
         # can rebase both trackers before the first observation is consumed.
@@ -1754,6 +1569,12 @@ class KardsCompanionPlugin(NekoPluginBase):
             # No observation may be inherited from the previous match when
             # this tick skips the unit task.
             state.units = []
+            with self._card_lock:
+                stale_cards = bool(self._recognized_cards) or (
+                    bool(self._card_pending)
+                    and int(self._card_pending_frame or 0) != int(frame_id))
+            if stale_cards:
+                self._clear_current_cards("new_match")
         if pre.get("resume"):
             if self.tracker.in_match:
                 self.tracker.rebase()
@@ -1761,26 +1582,10 @@ class KardsCompanionPlugin(NekoPluginBase):
                 self._unit_tracker.rebase()
 
         if state.scene == SCENE_MATCH:
-            with self._scheduler_lock:
-                hud_due = (hud is not None
-                           and self.scheduler.due("hud", frame_id=frame_id))
-                unit_due = self.scheduler.due("unit", frame_id=frame_id)
-            if hud_due:
-                started = time.monotonic()
-                hud_values = self._hud_read_gated(image, hud)
-                # A missing OCR field never erases the last known value; the
-                # tracker already treats None as "no comparison this frame".
-                for key in ("my_hq", "enemy_hq", "my_credits", "my_credit_cap"):
-                    value = hud_values.get(key)
-                    if value is not None:
-                        setattr(state, key, value)
-                with self._scheduler_lock:
-                    self.scheduler.mark_duration(
-                        "hud", max(0.0, time.monotonic() - started))
             if unit_due:
                 started = time.monotonic()
                 unit_diagnostics = self._apply_detector(
-                    state, image, frame_id=frame_id, run=True,
+                    state, image, detections, frame_id=frame_id,
                     observed_at=observed_at,
                     observation=self._observation_evidence(capture, result, health))
                 # A unit-due tick is the only tick allowed to advance unit
@@ -1793,6 +1598,20 @@ class KardsCompanionPlugin(NekoPluginBase):
                 with self._scheduler_lock:
                     self.scheduler.mark_duration(
                         "unit", max(0.0, time.monotonic() - started))
+
+            # ---- card 任务：待分类裁图 → card_cls → recognized_cards ------
+            with self._scheduler_lock:
+                card_due = self.scheduler.due("card", frame_id=frame_id)
+            if card_due:
+                started = time.monotonic()
+                try:
+                    self._run_card_task(state, observed_at=observed_at)
+                except Exception as exc:
+                    self.logger.warning("card task failed: {}: {}",
+                                        type(exc).__name__, exc)
+                with self._scheduler_lock:
+                    self.scheduler.mark_duration(
+                        "card", max(0.0, time.monotonic() - started))
 
         snapshot = RuntimeSnapshot(
             seq=seq, observed_at=observed_at, health=health, frame=frame,
@@ -1838,9 +1657,17 @@ class KardsCompanionPlugin(NekoPluginBase):
                     if callable(reset_match):
                         reset_match()
                 state.units = []
+                self._clear_current_cards("confirmed_exit")
                 self._confirmed_exit_handled = True
             elif pre.get("new_match") or (self.tracker.in_match and not confirmed_exit):
                 self._confirmed_exit_handled = False
+
+            if terminal_frame:
+                self._clear_current_cards("match_ended")
+            if not bool(scene_snapshot.get("context_valid")):
+                # An unknown/menu/draft frame invalidates the live facts and
+                # drops the match-scoped card faces immediately.
+                self._clear_current_cards("scene_invalid")
 
             if resumed or pre.get("resume"):
                 # Conditions that were already true before a pause are
@@ -1864,19 +1691,32 @@ class KardsCompanionPlugin(NekoPluginBase):
                 deduped.append(event)
             events = deduped
 
+            # One unified view for read/respond/tool, built from the *same*
+            # snapshot after tracker/scenario and before any host call.  Source
+            # timestamps are capture/UI samples, not this commit time.
+            state.situation = build_situation(
+                state,
+                models=self._models_payload(),
+                observations=self._recognized_cards_payload(),
+                session_id=session_id,
+                frame_id=frame_id,
+                observed_at=observed_at,
+                now=observed_at,
+                context_valid=bool(scene_snapshot.get("context_valid")),
+                reason=str(scene_snapshot.get("reason") or ""),
+                ui_observed_at=self._last_ui_observation_at,
+                events=events,
+                unit_diagnostics=self._last_unit_diagnostics,
+                observation_valid=state.unit_observation_valid,
+                scenario=scenario_name,
+                ui_signals=self._last_ui_signals,
+                scene_confidence=self._last_ui_scene_confidence,
+            )
+
             # Commit the full state only after the trackers have consumed it.
             # MatchTracker mutates lineage/game_number in place, so this is the
             # canonical baseline for the next scheduled task.
             self._pipeline_state = state
-            recording_in_match = bool(
-                state.scene == SCENE_MATCH
-                and scene_snapshot.get("context_valid")
-                and not terminal_frame and not confirmed_exit)
-            self._recording_in_match = recording_in_match
-            if not recording_in_match or not self._perception_settings.recording_enabled:
-                self._recording_accepting = False
-            elif self._recording_match_live:
-                self._recording_accepting = not self._user_paused
             self._previous_snapshot = snapshot
             self._last_trusted_snapshot = snapshot
             self._last_detector_diagnostics = [
@@ -1931,30 +1771,11 @@ class KardsCompanionPlugin(NekoPluginBase):
         self._attach_frame_evidence(
             events, frame, session_id=session_id, seq=seq,
             observed_at=observed_at)
-        # Local recording is independent of LLM consent and dry-run.  The
-        # capture callback queues every frame while an in-match session is
-        # live; here we only control the session/scene boundary after the
-        # scenario resolver has confirmed a live match context.
-        recording_in_match = bool(self._recording_in_match)
-        if not (terminal or confirmed_exit):
-            if recording_in_match:
-                if pre.get("new_match") or not self._recording_match_live:
-                    self._start_recording_match(session_id)
-                else:
-                    self._recording_set_active(True, "in_match")
-            else:
-                self._recording_set_active(
-                    False, f"scene_{state.scene or SCENE_UNKNOWN}")
         self._record_events(events)
         self._dispatch_candidates(
             events, state, session_id=session_id,
             scenario=scenario_name, context_token=context_token,
             token_epoch=token_epoch, observed_at=observed_at)
-        if terminal or confirmed_exit:
-            # End after dispatch so a confirmed terminal event is still
-            # arbitrated/delivered before the local session is cleaned.
-            self._end_recording_match(
-                "match_ended" if terminal else "confirmed_exit")
         validity = self._context_validity(observed_at)
         if (self.tracker.in_match and validity["valid"]
                 and not self._user_paused):
@@ -1985,56 +1806,120 @@ class KardsCompanionPlugin(NekoPluginBase):
             details.setdefault("evidence", dict(evidence))
             event.details = details
 
-    def _hud_read_gated(self, image, hud: HudReader) -> dict[str, Any]:
-        # RapidOCR 单次 200ms+，每 tick 全帧跑会挤爆 333ms 预算：角落指纹不变即复用上值
-        w, h = image.size
-        fp = dhash(image.crop((0, 0, int(w * 0.75), h)))
-        with self._lifecycle_lock:
-            if not self._monitoring or self._user_paused:
-                return {}
-            epoch = self._epoch
-            if self._hud_hash is not None and hamming(fp, self._hud_hash) <= 2:
-                return self._hud_cache
-        result = hud.read(image)
-        with self._lifecycle_lock:
-            # A stop may have reset the HUD while OCR was running; never commit
-            # a stale read into the next session.
-            if not self._monitoring or self._user_paused or self._epoch != epoch:
-                return {}
-            self._hud_hash = fp
-            self._hud_cache = result
-        return result
+    def _detect_ui(self, image) -> list[Any] | None:
+        """运行界面检测模型；不可用/失败返回 ``None``（区别于空检测）。"""
+        try:
+            detections = self.ui_detector.detect(image)
+        except Exception as exc:
+            self.logger.warning("ui detector step failed: {}: {}",
+                                type(exc).__name__, exc)
+            self._ui_detect_status = f"detector_error:{type(exc).__name__}"
+            return None
+        self._ui_detect_status = ("model_unavailable" if detections is None
+                                  else "ok")
+        return detections
 
-    @staticmethod
-    def _region_anchors(detections: Any) -> list[dict[str, Any]]:
-        """Convert only reliable object boxes into calibrator anchors.
+    def _stage_card_crops(self, detections: list[Any], image, frame_id: int,
+                          *, observed_at: float | None = None) -> None:
+        """unit 任务产出的 card_hand/played_card 框进入待分类队列。
 
-        The detector exposes ``conf`` while RegionCalibrator expects
-        ``confidence``; passing Detection objects directly would silently look
-        like 1.0 confidence and let a weak box move the HUD.  Only detached
-        boxes (never dHash/whole-image guesses) at >= 0.5 are eligible.
+        只暂存最近一帧的框、图像引用、**采集源时间**与所属 session；消费
+        水位由 card 任务维护，同一帧不会重复分类、重复计数。消费时绝不把
+        “当前 tick 时间”伪造成观测时间。
         """
-        anchors: list[dict[str, Any]] = []
-        for det in detections or ():
-            name = str(getattr(det, "name", "") or "")
-            if name not in {"frontline", "end_turn_button", "hq"}:
+        pending = [(det.name, det) for det in detections or ()
+                   if getattr(det, "name", "") in ("card_hand", "played_card")]
+        with self._card_lock:
+            self._card_pending = pending
+            self._card_pending_frame = int(frame_id)
+            self._card_pending_at = float(
+                observed_at if observed_at is not None else time.time())
+            self._card_pending_session = str(self._session_id or "")
+            self._card_image = image
+
+    def _run_card_task(self, state: MatchState, *, observed_at: float) -> None:
+        """card 任务：裁图 → card_cls → recognized_cards 区域观察。
+
+        * 裁图短边 < CARD_CROP_MIN_SIDE 直接跳过（过小裁图不可信）；
+        * 分类成功（非 unknown）才写入 recognized_cards；
+        * played_card 是放大/悬停的牌面区域观察，不代表已经打出，也不携带
+          敌我信息：绝不写 last_order_card、绝不产生 E_ORDER_CARD；
+        * 每条观察带 session_id / source_frame / **采集源 observed_at** /
+          appearance，不伪造单位 instance_id，也不把消费时刻当观测时刻；
+        * 白名单为空（trusted_card_count=0）时绝不写入任何卡面身份；
+        * 同一 pending 帧只消费一次（帧号高水位），且只消费与当前 session
+          一致的暂存帧。
+        """
+        with self._card_lock:
+            pending_frame = int(self._card_pending_frame or 0)
+            pending = list(self._card_pending)
+            image = self._card_image
+            pending_at = float(self._card_pending_at or 0.0) or float(
+                observed_at or 0.0)
+            pending_session = str(self._card_pending_session or "")
+            consumed = int(getattr(self, "_card_consumed_frame", 0))
+            current_session = str(self._session_id or "")
+        if image is None or not pending or pending_frame <= consumed:
+            return
+        if pending_session and current_session and pending_session != current_session:
+            # A different session's staged frame must never leak into this one.
+            return
+        if not self.card_classifier.available:
+            return
+        # Whitelist enforcement belongs to CardClassifier (production empty
+        # whitelist -> unknown).  The unified situation builder additionally
+        # gates recognized_cards on trusted_card_count, so a fake test
+        # classifier may produce observations without weakening production.
+        recognized: list[dict[str, Any]] = []
+        for index, (region, det) in enumerate(pending):
+            try:
+                short_side = min(float(det.width()), float(det.height()))
+            except Exception:
+                continue
+            if short_side < CARD_CROP_MIN_SIDE:
                 continue
             try:
-                confidence = float(getattr(det, "conf", 0.0) or 0.0)
-                x1 = float(getattr(det, "x1", 0.0))
-                y1 = float(getattr(det, "y1", 0.0))
-                x2 = float(getattr(det, "x2", 0.0))
-                y2 = float(getattr(det, "y2", 0.0))
-            except (TypeError, ValueError):
+                crop = det.crop(image)
+            except Exception:
                 continue
-            if confidence < 0.5 or x2 <= x1 or y2 <= y1:
+            appearance = CARD_APPEARANCE_BY_REGION.get(region)
+            result = self.card_classifier.classify(crop, appearance)
+            if result is None:
+                break  # 模型推理失败：本帧剩余裁图一并放弃
+            if not result.known:
                 continue
-            anchors.append({
-                "name": name,
-                "bbox": (x1, y1, x2 - x1, y2 - y1),
-                "confidence": confidence,
+            recognized.append({
+                "observation_id": f"card:{pending_frame}:{index}",
+                "session_id": pending_session or current_session,
+                "frame_id": pending_frame,
+                "source_frame": pending_frame,
+                "observed_at": round(float(pending_at), 3),
+                "appearance": appearance or region,
+                "card_id": result.card_id,
+                "name": result.name,
+                "region": region,
+                "conf": float(result.conf),
             })
-        return anchors
+
+        with self._card_lock:
+            self._card_consumed_frame = pending_frame
+            if recognized:
+                self._recognized_cards = (
+                    self._recognized_cards + recognized)[-RECOGNIZED_CARDS_LIMIT:]
+
+    def _clear_current_cards(self, reason: str) -> None:
+        """Drop match-scoped card faces; a new session/match never inherits them."""
+        with self._card_lock:
+            had_cards = bool(self._recognized_cards or self._card_pending)
+            self._card_pending = []
+            self._card_pending_frame = 0
+            self._card_pending_at = 0.0
+            self._card_pending_session = ""
+            self._card_image = None
+            self._recognized_cards = []
+        if had_cards:
+            self.timeline.record("cards", "cleared", ts=time.time(),
+                                 reason=str(reason or "cleared")[:80])
 
     @staticmethod
     def _observation_evidence(capture: Any, result: Any,
@@ -2064,40 +1949,17 @@ class KardsCompanionPlugin(NekoPluginBase):
             "capture_reading": bool(health.reading),
         }
 
-    def _apply_detector(self, state: MatchState, image, *, frame_id: int,
-                        run: bool, observed_at: float | None = None,
+    def _apply_detector(self, state: MatchState, image, detections: list[Any] | None,
+                        *, frame_id: int, observed_at: float | None = None,
                         observation: dict[str, Any] | None = None
                         ) -> dict[str, Any]:
-        """Run the due unit task and commit its trajectory units to state.
+        """Consume the due unit observation and commit its trajectory units.
 
-        ``None`` (model unavailable/error) and ``[]`` (successful empty board)
-        are distinct evidence: the former retains confirmed last-known units
-        with ``observed=False`` and never advances a miss counter.
+        ``detections`` 由 unit 任务的 :meth:`_detect_ui` 产出：``None``（模型
+        不可用/推理失败）与 ``[]``（真实空棋盘）是不同的证据——前者保留已确认
+        的 last-known units（``observed=False``）且不推进丢失计数，后者才推进
+        3 帧缺失语义。ROI 区域校准已随 OCR 链路移除。
         """
-        if not run:
-            return {}
-        detections: list[Any] | None = None
-        if self._detector is None:
-            status = "model_unavailable"
-        else:
-            try:
-                raw = self._detector.detect(image)
-            except Exception as exc:
-                self.logger.warning("detector step failed: {}: {}",
-                                    type(exc).__name__, exc)
-                status = f"detector_error:{type(exc).__name__}"
-            else:
-                if raw is None:
-                    status = "model_unavailable"
-                else:
-                    try:
-                        detections = list(raw)
-                    except Exception as exc:
-                        detections = None
-                        status = f"detector_error:{type(exc).__name__}"
-                    else:
-                        status = "ok"
-
         source_at = time.time() if observed_at is None else float(observed_at)
         gate = observation or {}
         with self._unit_lock:
@@ -2108,7 +1970,9 @@ class KardsCompanionPlugin(NekoPluginBase):
                 observed_at=source_at,
                 detector_available=detections is not None,
                 observation_valid=detections is not None,
-                status=status,
+                status=("ok" if detections is not None
+                        else getattr(self, "_ui_detect_status",
+                                     "model_unavailable")),
                 occlusion_state=gate.get("occlusion_state"),
                 foreground=gate.get("foreground"),
                 backend=str(gate.get("backend") or ""),
@@ -2119,42 +1983,10 @@ class KardsCompanionPlugin(NekoPluginBase):
             diagnostics["captured_at"] = round(source_at, 3)
             self._last_unit_diagnostics = copy.deepcopy(diagnostics)
 
-        # Layout calibration never invents anchors from a dHash or the whole
-        # frame.  No detector/anchors simply yields the proportional,
-        # explicitly-unverified layout; it is not a failure.
-        anchors = self._region_anchors(detections) if detections is not None else None
-        try:
-            with self._region_lock:
-                layout = self.region_calibrator.calibrate(
-                    image, anchors=anchors, now=time.monotonic())
-                signature = (
-                    layout.state,
-                    layout.width,
-                    layout.height,
-                    tuple(sorted(
-                        (name, tuple(tuple(rect) for rect in rects))
-                        for name, rects in layout.regions.items())),
-                )
-                changed = signature != self._region_signature
-                if changed:
-                    self._region_signature = signature
-            hud = getattr(self, "hud", None)
-            if changed and hud is not None:
-                setter = getattr(hud, "set_regions", None)
-                if callable(setter):
-                    setter(layout)
-                # The ROI geometry changed; a previous crop's OCR cache is no
-                # longer valid even when the screen dHash is unchanged.
-                with self._lifecycle_lock:
-                    self._hud_hash = None
-                    self._hud_cache = {}
-        except Exception as exc:
-            self.logger.warning("region calibration failed: {}: {}",
-                                type(exc).__name__, exc)
-
         for unit in units:
             if not getattr(unit, "first_seen_turn", 0):
                 unit.first_seen_turn = int(state.turn_number or 0)
+        # 单位身份保持感知/轨迹原样：未绑定 card_id 的单位不得借区域观察命名。
         state.units = units
         return diagnostics
 
@@ -2171,6 +2003,35 @@ class KardsCompanionPlugin(NekoPluginBase):
             elif event.kind == E_MATCH_END:
                 self._schedule_persist(event)
 
+    @staticmethod
+    def _chatter_is_grounded(state: MatchState) -> bool:
+        """Whether the situation contains any verified board/card fact.
+
+        A "盘面平稳" chatter is only allowed when there is a supported unit
+        observation (observed or retained) or a fresh card observation.  When
+        the UI capabilities cannot verify a board, silence is the honest reply.
+        """
+        situation = situation_payload(state)
+        facts = situation.get("facts") if isinstance(situation, dict) else None
+        units = (facts or {}).get("units") or {}
+        counts = units.get("counts") or {}
+        if units.get("supported") and isinstance(counts, dict):
+            try:
+                if (int(counts.get("observed", 0))
+                        + int(counts.get("retained", 0))) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        if situation.get("recognized_cards"):
+            return True
+        return False
+
+    def _grounded_candidates(self, candidates: list[GameEvent],
+                             state: MatchState) -> list[GameEvent]:
+        if self._chatter_is_grounded(state):
+            return list(candidates)
+        return [event for event in candidates if event.kind != E_CHATTER]
+
     def _dispatch_candidates(self, candidates: list[GameEvent],
                              state: MatchState, *, session_id: str,
                              scenario: str, context_token: str | None,
@@ -2181,6 +2042,7 @@ class KardsCompanionPlugin(NekoPluginBase):
         tick = getattr(self.dispatcher, "tick", None)
         if not callable(tick):
             return
+        candidates = self._grounded_candidates(candidates, state)
         # Tracker events are stamped with its own wall clock, which can be a
         # fraction of a millisecond after the capture's observed_at.  Use the
         # newest source timestamp so a fresh event is never labelled future.
@@ -2204,7 +2066,7 @@ class KardsCompanionPlugin(NekoPluginBase):
             except Exception:
                 pass
         try:
-            outcomes = tick(
+            tick(
                 candidates, state,
                 scenario=scenario,
                 session_id=session_id,
@@ -2225,13 +2087,10 @@ class KardsCompanionPlugin(NekoPluginBase):
                             context_token: str | None,
                             token_epoch: int | None,
                             observed_at: float) -> None:
-        text = build_live_state_text(state).replace(
-            '"query_tool":"kards_live_state"',
-            f'"query_tool":"{_LIVE_STATE_TOOL_NAME}"',
-        )
-        target = resolve_target_lanlan(self)
-        publish = getattr(self.publisher, "publish", None)
-        if not callable(publish):
+        allowed, _blocked = self._export_allowed()
+        if not allowed:
+            # consent=false / dry-run / paused / stopped: no enter, no read,
+            # and no cleanup push that would bypass the gate policy.
             return
         if token_epoch is not None:
             try:
@@ -2239,18 +2098,67 @@ class KardsCompanionPlugin(NekoPluginBase):
                     return
             except Exception:
                 pass
+        if not state.situation:
+            validity = self._context_validity(observed_at)
+            state.situation = build_situation(
+                state,
+                models=self._models_payload(),
+                observations=self._recognized_cards_payload(),
+                session_id=session_id,
+                frame_id=self._last_ui_frame_id,
+                observed_at=observed_at,
+                now=observed_at,
+                context_valid=bool(validity["valid"]),
+                reason=validity["reason"],
+                ui_observed_at=self._last_ui_observation_at,
+                events=[],
+                unit_diagnostics=self._last_unit_diagnostics,
+                observation_valid=state.unit_observation_valid,
+                scenario=self.scenario.scenario,
+                ui_signals=self._last_ui_signals,
+                scene_confidence=self._last_ui_scene_confidence,
+            )
+        target = resolve_target_lanlan(self)
+        # Always ask the publisher to enter/refresh the context.  It is
+        # idempotent (coalesces unchanged target/session/instructions/TTL) and
+        # owns route-change cleanup; the local marker is diagnostic only and
+        # must never skip TTL refresh or an active-character change.
         try:
-            if _supports_kwarg(publish, "context_token"):
-                # Dispatcher read breaker + the same token bound at tick entry.
-                self.dispatcher.push_read(
-                    state, text=text, target=target, session_id=session_id,
-                    context_token=context_token, now=observed_at)
-            else:
-                # Publisher currently derives the gate token internally; this
-                # branch is only for a C revision that has not added the token
-                # parameter yet.  The epoch check above keeps stale ticks out.
-                publish(state, text=text, target=target, session_id=session_id,
-                        now=observed_at)
+            entered = self.publisher.enter(
+                state,
+                text=situation_context_text(state.situation),
+                target=target,
+                session_id=session_id,
+                context_token=context_token,
+                now=observed_at,
+                capabilities=state.situation.get("capabilities")
+                if isinstance(state.situation, dict) else None,
+            )
+        except Exception as exc:
+            entered = None
+            self.logger.warning("context enter failed: {}: {}",
+                                type(exc).__name__, exc)
+        entered_ok = bool(getattr(entered, "delivered", False))
+        if entered_ok:
+            with self._lifecycle_lock:
+                self._read_context_entered_token = str(context_token or "")
+                self._read_context_entered_session = str(session_id or "")
+                self._read_context_entered_fingerprint = str(
+                    getattr(entered, "fingerprint", "") or "")
+        else:
+            # failed/suppressed enter means the host has no current context
+            # explanation; do not push a read that pretends it exists.
+            return
+        text = build_live_state_text(
+            state, session_id=session_id).replace(
+            '"query_tool":"kards_live_state"',
+            f'"query_tool":"{_LIVE_STATE_TOOL_NAME}"',
+        )
+        try:
+            # The dispatcher read channel and this tick share one gate token.
+            self.dispatcher.push_read(
+                state, text=text, target=target, session_id=session_id,
+                context_token=context_token, now=observed_at)
         except Exception as exc:
             self.logger.warning("read publish failed: {}: {}", type(exc).__name__, exc)
 
@@ -2264,9 +2172,31 @@ class KardsCompanionPlugin(NekoPluginBase):
             token_epoch = None
         with self._lifecycle_lock:
             session_id = self._session_id or self._ensure_session_locked()
+        observed_at = time.time()
+        if not state.situation:
+            # Explicit helper call: the caller supplied a state to publish, so
+            # build a coherent manual snapshot instead of letting the publisher
+            # reject an empty/context-invalid situation.
+            state.situation = build_situation(
+                state,
+                models=self._models_payload(),
+                observations=self._recognized_cards_payload(),
+                session_id=session_id,
+                frame_id=self._last_ui_frame_id or 0,
+                observed_at=observed_at,
+                now=observed_at,
+                context_valid=True,
+                reason="manual_publish",
+                ui_observed_at=observed_at,
+                unit_diagnostics=self._last_unit_diagnostics,
+                observation_valid=state.unit_observation_valid,
+                scenario=self.scenario.scenario,
+                ui_signals=self._last_ui_signals,
+                scene_confidence=self._last_ui_scene_confidence,
+            )
         self._publish_live_state(
             state, session_id=session_id, context_token=token,
-            token_epoch=token_epoch, observed_at=time.time())
+            token_epoch=token_epoch, observed_at=observed_at)
 
     def _on_delivered(self, event: GameEvent, state: MatchState,
                       metadata: Any = None) -> None:
@@ -2629,9 +2559,9 @@ class KardsCompanionPlugin(NekoPluginBase):
         return Ok({"dry_run": flag})
 
     @ui.action(id="perception_settings_set", label="保存感知设置")
-    @plugin_entry(id="perception_settings_set", name="感知与录制设置",
-                  description="严格白名单：采样预设/四项 FPS/客户区 ROI 自动校准/"
-                              "本地录制开关与 64..65536MB 上限。未知字段与固定项直接拒绝。",
+    @plugin_entry(id="perception_settings_set", name="感知采样设置",
+                  description="严格白名单：采样预设与采集/变化/单位/卡牌四项 FPS。"
+                              "未知字段与已移除的 HUD/ROI/录像旧键直接拒绝。",
                   input_schema={
                       "type": "object",
                       "properties": {
@@ -2640,13 +2570,8 @@ class KardsCompanionPlugin(NekoPluginBase):
                               "enum": ["low_cost", "balanced", "quality", "custom"]},
                           "capture_fps": {"type": "number", "minimum": 1, "maximum": 30},
                           "change_fps": {"type": "number", "minimum": 0.5, "maximum": 15},
-                          "hud_fps": {"type": "number", "minimum": 0.5, "maximum": 6},
                           "unit_fps": {"type": "number", "minimum": 0.5, "maximum": 12},
-                          "roi_auto_calibrate": {"type": "boolean"},
-                          "recording_enabled": {"type": "boolean"},
-                          "recording_max_mb": {"type": "integer",
-                                               "minimum": RECORDING_MAX_MB_MIN,
-                                               "maximum": RECORDING_MAX_MB_MAX},
+                          "card_fps": {"type": "number", "minimum": 0.5, "maximum": 12},
                       },
                   })
     async def perception_settings_set(self, **kwargs):
@@ -2674,7 +2599,6 @@ class KardsCompanionPlugin(NekoPluginBase):
         return Ok({
             "updated": sorted(patch),
             "perception_settings": self._perception_settings_payload(),
-            "recording": self._recording_payload(),
         })
 
     @ui.action(id="deck_import", label="导入卡组")
@@ -2702,8 +2626,7 @@ class KardsCompanionPlugin(NekoPluginBase):
             "chatter_interval_seconds", "cooldown_seconds",
             "critical_cooldown_seconds", "min_priority", "do_not_disturb",
             "perf_mode", "tick_ms", "perception_preset", "capture_fps",
-            "change_fps", "hud_fps", "unit_fps", "capture_fps_power_saver",
-            "roi_auto_calibrate", "recording_enabled", "recording_max_mb",
+            "change_fps", "unit_fps", "card_fps", "capture_fps_power_saver",
             "catalog_enabled", "catalog_refresh_hours", "vlm_enabled",
             "plugin_owned_output_enabled", "user_chat_quiet_window_seconds",
             "battle_output_quiet_window_seconds",
@@ -2717,9 +2640,16 @@ class KardsCompanionPlugin(NekoPluginBase):
         return out
 
     def _context_validity(self, now: float | None = None) -> dict[str, Any]:
-        """Unified trusted-context check for status, tools and read publishing."""
+        """Unified trusted-context check for status, tools and read publishing.
+
+        Freshness is measured from the last **new UI-detector sample**, not from
+        the capture thread's latest frame.  A static screen keeps producing new
+        capture timestamps; without an independent UI heartbeat that must not
+        look like a fresh board.
+        """
         current = time.time() if now is None else float(now)
-        max_age = max(1.0, _tick_seconds(self._cfg) * 3.0)
+        max_age = min(SITUATION_FRESH_MAX_AGE_SECONDS,
+                      max(0.5, _tick_seconds(self._cfg) * 3.0))
         with self._lifecycle_lock:
             snapshot = self._last_trusted_snapshot
             monitoring = self._monitoring
@@ -2727,8 +2657,13 @@ class KardsCompanionPlugin(NekoPluginBase):
             session_id = self._session_id
             tracker_session = self.tracker.session_id
             in_match = self.tracker.in_match
+            ui_observed_at = self._last_ui_observation_at
+            ui_frame_id = int(self._last_ui_frame_id or 0)
+            ui_failed = bool(self._ui_observation_failed)
         scene_snapshot = self.scenario.snapshot()
         age_ms: float | None = None
+        source_age_ms: float | None = None
+        ui_age_ms: float | None = None
         reason = ""
         if not monitoring:
             reason = "monitoring_stopped"
@@ -2739,9 +2674,18 @@ class KardsCompanionPlugin(NekoPluginBase):
         elif not snapshot.trusted:
             reason = "snapshot_not_trusted"
         else:
-            age = max(0.0, current - float(snapshot.observed_at))
+            source_age = max(0.0, current - float(snapshot.observed_at))
+            source_age_ms = round(source_age * 1000.0, 1)
+            measured_at = (float(ui_observed_at)
+                           if ui_observed_at is not None
+                           else float(snapshot.observed_at))
+            age = max(0.0, current - measured_at)
             age_ms = round(age * 1000.0, 1)
-            if age > max_age:
+            if ui_observed_at is not None:
+                ui_age_ms = age_ms
+            if ui_failed:
+                reason = "ui_observation_unavailable"
+            elif age > max_age:
                 reason = "context_stale"
             elif snapshot.state.scene != SCENE_MATCH or not in_match:
                 reason = "scene_not_match"
@@ -2753,8 +2697,11 @@ class KardsCompanionPlugin(NekoPluginBase):
             "valid": not reason,
             "reason": reason,
             "age_ms": age_ms,
+            "source_age_ms": source_age_ms,
+            "ui_age_ms": ui_age_ms,
             "max_age_ms": round(max_age * 1000.0, 1),
             "snapshot_seq": None if snapshot is None else snapshot.seq,
+            "ui_frame_id": ui_frame_id or None,
             "session_id": session_id,
         }
 
@@ -2812,7 +2759,6 @@ class KardsCompanionPlugin(NekoPluginBase):
         return payload
 
     def _detector_payload(self) -> dict[str, Any]:
-        snapshot = self._previous_snapshot
         validity = self._context_validity()
         paused = not bool(validity["valid"])
         with self._lifecycle_lock:
@@ -2890,8 +2836,8 @@ class KardsCompanionPlugin(NekoPluginBase):
             "tick_seconds": _loop_seconds(self._cfg),
             "capture_fps": _capture_fps(self._cfg),
             "change_fps": self._perception_settings.change_fps,
-            "hud_fps": self._perception_settings.hud_fps,
             "unit_fps": self._perception_settings.unit_fps,
+            "card_fps": self._perception_settings.card_fps,
             "mode": self._cfg.get("mode"),
             "dry_run": _boolean(self._cfg.get("dry_run"), False),
             "scenario": scene.get("scenario"),
@@ -2921,7 +2867,9 @@ class KardsCompanionPlugin(NekoPluginBase):
             "detectors": self._detector_payload(),
             "delivery": self._delivery_payload(),
             "perception_settings": self._perception_settings_payload(),
-            "recording": self._recording_payload(),
+            "models": self._models_payload(),
+            "recognized_cards": self._recognized_cards_payload(),
+            "fps_measured": self._measured_fps_payload(),
             "scenario": scene_snapshot,
             "timeline": self.timeline.as_dict(limit=20),
             "last_snapshot": (self._public_snapshot_dict(snapshot)
@@ -2939,9 +2887,9 @@ class KardsCompanionPlugin(NekoPluginBase):
             "game_number": self.tracker.game_number,
             "context_valid": bool(scene_snapshot.get("context_valid")),
             "classification_valid": self._classification_valid,
-            "detector_loaded": self._detector is not None,
-            "ocr_available": self._ocr is not None,
-            "ocr_telemetry": (getattr(getattr(self, "hud", None), "telemetry", {}) or {}),
+            "detector_loaded": bool(
+                getattr(self.ui_detector, "available",
+                        callable(getattr(self.ui_detector, "detect", None)))),
             "catalog": {"ready": self.catalog.ready, "cards": self.catalog.size(),
                         "fetched_at": self.catalog.fetched_at, "error": self.catalog.last_error,
                         "builtin": self.catalog.builtin},
@@ -2978,17 +2926,44 @@ class KardsCompanionPlugin(NekoPluginBase):
         return {"status": payload if isinstance(payload, dict) else {}}
 
     @llm_tool(name="kards_get_live_state",
-              description="查询 KARDS 当前对局结构化状态：HQ 血量、双方回合、单位列表（含身份置信度）、最近事件。"
-                          "无有效帧/分类、consent 关闭或 dry-run 时返回 paused=true 且 state=null，"
-                          "不得用旧画面推断局势。玩家问局势时用。",
+              description="查询 KARDS 统一局势视图：已确认场景、当前/保留/未知侧别单位、"
+                          "短时卡面观察及不支持能力；总部血量、资源、当前攻防、回合归属未知，"
+                          "不编造。无有效帧/分类、consent 关闭或 dry-run 时返回 paused=true 且 "
+                          "state=null，不得用旧画面推断局势。玩家问局势时用。",
               parameters={"type": "object", "properties": {}})
     async def kards_get_live_state(self, **_):
         health = self._current_health()
         validity = self._context_validity()
         allowed, blocked = self._export_allowed()
         usable = bool(allowed and validity["valid"])
-        current = self.tracker.current or MatchState()
-        state = current.to_public_dict() if usable else None
+        with self._lifecycle_lock:
+            snapshot = self._last_trusted_snapshot
+            current = (snapshot.state if snapshot is not None
+                       else (self.tracker.current or MatchState()))
+        situation = situation_payload(current) if usable else None
+        if usable and not situation:
+            # Same-snapshot fallback for states constructed before the unified
+            # builder was wired; never expose raw tracker internals.
+            observed_at = (snapshot.observed_at if snapshot is not None
+                           else time.time())
+            frame_id = (snapshot.frame.frame_id if snapshot is not None else 0)
+            situation = build_situation(
+                current,
+                models=self._models_payload(),
+                observations=self._recognized_cards_payload(),
+                session_id=self._session_id,
+                frame_id=frame_id,
+                observed_at=observed_at,
+                now=time.time(),
+                context_valid=bool(validity["valid"]),
+                reason=validity["reason"],
+                ui_observed_at=self._last_ui_observation_at,
+                unit_diagnostics=self._last_unit_diagnostics,
+                observation_valid=current.unit_observation_valid,
+                scenario=self.scenario.scenario,
+                ui_signals=self._last_ui_signals,
+                scene_confidence=self._last_ui_scene_confidence,
+            )
         reason = blocked or validity["reason"] or ("" if usable else "not_in_match")
         return {
             "monitoring": self._monitoring,
@@ -2997,13 +2972,20 @@ class KardsCompanionPlugin(NekoPluginBase):
             "capture": self._public_health(health),
             "context_valid": bool(validity["valid"]),
             "context_age_ms": validity["age_ms"],
+            "source_age_ms": validity.get("source_age_ms"),
+            "ui_age_ms": validity.get("ui_age_ms"),
             "snapshot_seq": validity["snapshot_seq"],
             "classification_valid": self._classification_valid,
             "session_id": self._session_id,
-            "in_match": self.tracker.in_match,
-            "state": state,
+            "in_match": bool(getattr(current, "in_match", False)) if usable else False,
+            # Unified view only: cards/units/capabilities/limitations come from
+            # the same frozen situation used by read/respond.
+            "state": situation if usable else None,
+            "situation": situation if usable else None,
             # Blocked tools expose no event details, deck or game facts.
-            "recent_events": self._events_log[-12:] if usable else [],
+            "recent_events": (
+                list(((situation or {}).get("facts") or {}).get("events") or [])[:10]
+                if usable else []),
             "deck": (None if (not usable or self._deck is None) else {
                 "main": self._deck.main_nation, "ally": self._deck.ally_nation}),
             "data_policy": {

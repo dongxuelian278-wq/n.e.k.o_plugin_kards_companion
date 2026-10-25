@@ -20,9 +20,8 @@ Backend order (first success wins, with an explicit degradation report):
    backend here claims verified occlusion support.
 
 The capture producer can run as a single-call-driven loop (default) or a
-background worker (``capture_thread_enabled=True``).  Successful frames may be
-delivered to ``on_frame`` after the capture lock is released; callbacks must
-do only a non-blocking enqueue, never OCR or host delivery.
+background worker (``capture_thread_enabled=True``).  录像帧回调链已随录像
+功能移除：生产者只维护 ``latest_capture()`` 供感知循环消费最新帧。
 
 Capture is read-only: it never clicks or types.
 """
@@ -39,7 +38,6 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -638,42 +636,6 @@ def hamming(a: int, b: int) -> int:
     return bin(a ^ b).count("1")
 
 
-class FrameRing:
-    """JPEG ring buffer so a briefly visible order card can be recovered."""
-
-    def __init__(self, seconds: float = 4.0, fps: float = 8.0) -> None:
-        self._frames: deque[tuple[float, bytes]] = deque()
-        self._span = float(seconds)
-        self._lock = threading.Lock()
-        self._fps = max(0.5, float(fps))
-
-    @property
-    def fps(self) -> float:
-        with self._lock:
-            return self._fps
-
-    def set_fps(self, fps: float) -> None:
-        """Keep the retention margin in sync with the producer's frame rate."""
-        self._fps = max(0.5, float(fps))
-
-    def put(self, ts: float, image: Image.Image) -> None:
-        buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=70)
-        with self._lock:
-            self._frames.append((ts, buf.getvalue()))
-            cutoff = ts - self._span - 2.0 / self._fps
-            while self._frames and self._frames[0][0] < cutoff:
-                self._frames.popleft()
-
-    def recent(self, count: int = 4) -> list[tuple[float, bytes]]:
-        with self._lock:
-            return list(self._frames)[-count:]
-
-    def between(self, start_ts: float, end_ts: float) -> list[tuple[float, bytes]]:
-        with self._lock:
-            return [f for f in self._frames if start_ts <= f[0] <= end_ts]
-
-
 # ---------------------------------------------------------------- host bridge
 
 def _resolve_host_capture_base(explicit: str | None) -> str:
@@ -824,10 +786,11 @@ def _payload_size(payload: dict[str, Any]) -> tuple[int, int] | None:
 class ScreenCapture:
     """Single-owner frame capture with health evidence.
 
-    Existing attributes (``fps``, ``ring``, ``latest``, ``latest_hash``,
-    ``window``, ``foreground``, ``backend``, ``stats``) are preserved for the
+    Existing attributes (``fps``, ``latest``, ``latest_hash``, ``window``,
+    ``foreground``, ``backend``, ``stats``) are preserved for the
     orchestration layer.  ``health_snapshot()`` and ``latest_capture()`` are
-    the new, validated interfaces.
+    the new, validated interfaces.  录像专用的 ``on_frame``/``ring`` 链路已
+    删除；``ring_enabled`` 参数仅为兼容旧调用保留并被忽略。
 
     Capture ownership is explicit: by default ``start()`` only marks the
     capture as running and the caller drives :meth:`capture_frame` from its
@@ -849,14 +812,12 @@ class ScreenCapture:
         occlusion_probe: Callable[
             [WindowInfo, tuple[int, int, int, int]], bool | None
         ] | None = None,
-        on_frame: Callable[[CaptureResult], None] | None = None,
-        ring_enabled: bool = True,
+        ring_enabled: bool = False,
         capture_thread_enabled: bool = False,
     ) -> None:
+        del ring_seconds  # JPEG 环形缓冲已随录像功能移除
         self._capture_thread_enabled = bool(capture_thread_enabled)
         self._fps = max(0.5, float(fps))
-        self.ring_enabled = bool(ring_enabled)
-        self.ring = FrameRing(seconds=ring_seconds, fps=self._fps)
         self.latest: tuple[float, Image.Image] | None = None
         self.latest_hash: int | None = None
         self.window: WindowInfo | None = None
@@ -869,7 +830,6 @@ class ScreenCapture:
             "frames": 0,
             "errors": 0,
             "fallback_frames": 0,
-            "callback_errors": 0,
         }
 
         # New evidence / health state.
@@ -883,7 +843,6 @@ class ScreenCapture:
         self._image_grabber = image_grabber or ImageGrab.grab
         self._foreground_probe = foreground_probe or is_foreground
         self._occlusion_probe = occlusion_probe
-        self._on_frame = on_frame
 
         self._host_base = _resolve_host_capture_base(host_capture_base)
         self._host_enabled = bool(self._host_base)
@@ -902,10 +861,6 @@ class ScreenCapture:
         # Serializes capture attempts so one instance never lets a background
         # worker and a synchronous caller grab/write state at the same time.
         self._capture_lock = threading.Lock()
-        # Notification is deliberately outside _capture_lock, but the id
-        # high-water mark still makes duplicate delivery impossible.
-        self._notify_lock = threading.Lock()
-        self._notified_frame_id = 0
 
         self._frame_id = 0
         self._last_frame_ts: float | None = None
@@ -925,15 +880,9 @@ class ScreenCapture:
 
     @fps.setter
     def fps(self, value: float) -> None:
-        """Update the producer rate and every derived budget together.
-
-        The plugin reconfigures ``capture.fps`` at runtime; the ring retention
-        margin and ``max_frame_age_ms`` must follow, otherwise a power-saver
-        rate would keep using the old (too strict) staleness budget.
-        """
+        """Update the producer rate and the derived staleness budget."""
         fps_value = max(0.5, float(value))
         self._fps = fps_value
-        self.ring.set_fps(fps_value)
         self.max_frame_age_ms = self._max_frame_age_for(fps_value)
 
     @staticmethod
@@ -1170,21 +1119,6 @@ class ScreenCapture:
         self.occlusion_state = "clear"
         return True, ""
 
-    def _notify_frame(self, result: CaptureResult) -> None:
-        """Deliver exactly one callback per frame id, outside the capture lock."""
-        callback = self._on_frame
-        if callback is None:
-            return
-        with self._notify_lock:
-            if result.frame_id <= self._notified_frame_id:
-                return
-            self._notified_frame_id = result.frame_id
-        try:
-            callback(result)
-        except Exception:
-            # A recorder/queue callback must never kill the producer.
-            self.stats["callback_errors"] += 1
-
     def _grab_dxcam(self, bbox: tuple[int, int, int, int]) -> Image.Image | None:
         camera = self._try_dxcam()
         if camera is None:
@@ -1248,15 +1182,12 @@ class ScreenCapture:
             and worker.is_alive()
             and worker is not threading.current_thread()
         ):
-            # The worker already delivered this frame to on_frame; returning
-            # the snapshot must not deliver/capture it a second time.
+            # The worker is the single capture owner; a caller on another
+            # thread gets the worker's latest result instead of opening a
+            # second, competing capture path.
             return self._latest_result
         with self._capture_lock:
-            result = self._capture_frame_locked()
-        if result is not None:
-            # Recorder enqueue callback runs without the producer lock held.
-            self._notify_frame(result)
-        return result
+            return self._capture_frame_locked()
 
     def _capture_frame_locked(self) -> CaptureResult | None:
         self.fallback_reason = ""
@@ -1396,8 +1327,6 @@ class ScreenCapture:
         )
         self.latest = (captured_at, image)
         self.latest_hash = dhash(image)
-        if self.ring_enabled:
-            self.ring.put(captured_at, image)
         self.stats["frames"] += 1
         if fallback_reason:
             self.stats["fallback_frames"] += 1
@@ -1449,7 +1378,6 @@ class ScreenCapture:
             "trusted": bool(self._last_frame_trusted),
             "host_bridge_enabled": self._host_enabled,
             "host_bridge_confirmed": self.host_bridge_confirmed,
-            "ring_enabled": self.ring_enabled,
             "frame_id": self._frame_id,
             "stats": dict(self.stats),
         }
